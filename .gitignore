@@ -1,0 +1,3 @@
+# Keep real emails and secrets out of this repo
+backend/setup.local.sql
+*.local.sql
