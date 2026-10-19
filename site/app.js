@@ -12,7 +12,8 @@ var sb = null;
 var phase = "loading";          // loading | setup | signin | denied | error | ready
 var session = null;
 var authStep = "email";         // email | code
-var authEmail = "", authCode = "", authMsg = "", authBusy = false;
+var authEmail = "", authCode = "", authMsg = "", authDetail = "", authBusy = false;
+var loadDetail = "";
 var myKey = null;
 var members = [];
 var listMeta = new Map();       // owner -> {submitted_at}
@@ -125,29 +126,54 @@ function listFor(key) {
 function iBought(item) { return buyerByItem.get(item.id) === myKey; }
 
 /* ---------- auth ---------- */
-function friendlyAuthError(err) {
+function detailOf(err) {
+  if (!err) return "";
+  var parts = [];
+  if (err.message) parts.push(err.message);
+  if (err.code) parts.push("code " + err.code);
+  else if (err.status) parts.push("status " + err.status);
+  return parts.join(" \u00b7 ").slice(0, 300);
+}
+function sendError(err) {
   var m = (err && err.message) || "";
   if (/rate|seconds|too many/i.test(m)) return "Please wait a minute before asking for another code.";
-  if (/database error|family|not allowed|signups/i.test(m)) return "That email isn’t on the family list. Ask Alex to add it.";
-  if (/invalid|expired|token/i.test(m)) return "That code didn’t work. Check it, or ask for a new one.";
-  return "Something went wrong. Check the address and try again.";
+  if (/database error|not allowed|signups|family/i.test(m)) return "That email isn\u2019t on the family list. Ask Alex to add it.";
+  if (/api key|apikey/i.test(m)) return "The site\u2019s database key looks wrong. Check SUPABASE_ANON_KEY in config.js.";
+  if (/sending|smtp|mail/i.test(m)) return "The email couldn\u2019t be sent. Check the email (SMTP) settings in Supabase.";
+  if (/fetch|network|failed to/i.test(m)) return "Couldn\u2019t reach the server. Check your connection and the project URL in config.js.";
+  return "Couldn\u2019t send the code. See the details below.";
+}
+function verifyError(err) {
+  var m = (err && err.message) || "";
+  if (/rate|seconds|too many/i.test(m)) return "Too many tries. Wait a minute, then try again.";
+  if (/api key|apikey/i.test(m)) return "The site\u2019s database key looks wrong. Check SUPABASE_ANON_KEY in config.js.";
+  if (/fetch|network|failed to/i.test(m)) return "Couldn\u2019t reach the server. Check your connection.";
+  if (/invalid|expired|token/i.test(m)) return "That code didn\u2019t work. Check it, or ask for a new one.";
+  return "Couldn\u2019t check the code. See the details below.";
 }
 async function sendCode() {
   var email = authEmail.trim().toLowerCase();
   if (!/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(email)) { authMsg = "Enter the email address you use with the family."; renderAuth(); return; }
-  authEmail = email; authBusy = true; authMsg = ""; renderAuth();
-  var r = await sb.auth.signInWithOtp({ email: email, options: { shouldCreateUser: true } });
+  authEmail = email; authBusy = true; authMsg = ""; authDetail = ""; renderAuth();
+  var r;
+  try { r = await sb.auth.signInWithOtp({ email: email, options: { shouldCreateUser: true } }); }
+  catch (e) { r = { error: { message: (e && e.message) || "Failed to fetch" } }; }
   authBusy = false;
-  if (r.error) { authMsg = friendlyAuthError(r.error); renderAuth(); return; }
-  authStep = "code"; authCode = ""; authMsg = ""; renderAuth();
+  if (r.error) { authMsg = sendError(r.error); authDetail = detailOf(r.error); renderAuth(); return; }
+  authStep = "code"; authCode = ""; authMsg = ""; authDetail = ""; renderAuth();
 }
 async function verifyCode() {
   var code = authCode.replace(/\s+/g, "");
   if (code.length < 6) { authMsg = "Enter the 6-digit code from the email."; renderAuth(); return; }
-  authBusy = true; authMsg = ""; renderAuth();
-  var r = await sb.auth.verifyOtp({ email: authEmail, token: code, type: "email" });
+  authBusy = true; authMsg = ""; authDetail = ""; renderAuth();
+  var r;
+  try { r = await sb.auth.verifyOtp({ email: authEmail, token: code, type: "email" }); }
+  catch (e) { r = { error: { message: (e && e.message) || "Failed to fetch" } }; }
   authBusy = false;
-  if (r.error || !r.data || !r.data.session) { authMsg = friendlyAuthError(r.error || { message: "invalid" }); renderAuth(); return; }
+  if (r.error || !r.data || !r.data.session) {
+    var failure = r.error || { message: "No session was returned" };
+    authMsg = verifyError(failure); authDetail = detailOf(failure); renderAuth(); return;
+  }
   session = r.data.session;
   await enter();
 }
@@ -155,7 +181,7 @@ async function signOut() {
   stopPolling();
   try { await sb.auth.signOut(); } catch (e) { /* the local session is cleared either way */ }
   resetSession();
-  phase = "signin"; authStep = "email"; authCode = ""; authMsg = "";
+  phase = "signin"; authStep = "email"; authCode = ""; authMsg = ""; authDetail = "";
   render();
 }
 function resetSession() {
@@ -165,7 +191,7 @@ function resetSession() {
 
 /* ---------- entering the app ---------- */
 async function enter() {
-  phase = "loading"; render();
+  phase = "loading"; loadDetail = ""; render();
   try {
     var who = await sb.rpc("me");
     if (who.error) throw who.error;
@@ -177,6 +203,7 @@ async function enter() {
     startPolling();
   } catch (e) {
     if (/jwt|expired|not authenticated/i.test((e && e.message) || "")) { await signOut(); return; }
+    loadDetail = detailOf(e) || String(e);
     phase = "error"; render();
   }
 }
@@ -341,7 +368,8 @@ function setupView() {
     h("div", { class: "card" }, h("p", { text: "This site isn’t connected to its database yet. Open config.js and add the Supabase project URL and key, then reload the page." })));
 }
 function errorView() {
-  return h("div", { class: "panel" }, heroView("Couldn’t load the wishlist", "Check your connection, then try again."),
+  return h("div", { class: "panel" }, heroView("Couldn’t load the wishlist", "Check your connection, then try again. If it keeps happening, the database setup may not have been run."),
+    loadDetail ? h("p", { class: "muted", id: "load-detail", style: "font-size:13px;overflow-wrap:anywhere;padding:0 4px", text: "Details: " + loadDetail }) : null,
     h("div", { class: "bar", style: "position:static" }, h("span", { class: "muted", text: "Your saved lists are safe." }),
       h("button", { class: "btn primary", type: "button", onclick: enter, text: "Try again" })));
 }
@@ -372,12 +400,13 @@ function renderAuth() {
     card.append(g);
   }
   if (authMsg) card.append(h("p", { class: "err", role: "alert", text: authMsg }));
+  if (authMsg && authDetail) card.append(h("p", { class: "muted", id: "auth-detail", style: "font-size:13px;overflow-wrap:anywhere", text: "Details: " + authDetail }));
   var row = h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" });
   row.append(h("button", { class: "btn primary", type: "submit", id: "auth-go", disabled: authBusy ? true : null,
     text: authBusy ? "One moment…" : (authStep === "email" ? "Email me a code" : "Sign in") }));
   if (authStep === "code") {
     row.append(h("button", { class: "btn ghost", type: "button", id: "auth-resend", disabled: authBusy ? true : null, onclick: sendCode, text: "Send a new code" }));
-    row.append(h("button", { class: "btn ghost", type: "button", id: "auth-back", onclick: function () { authStep = "email"; authMsg = ""; renderAuth(); }, text: "Use a different email" }));
+    row.append(h("button", { class: "btn ghost", type: "button", id: "auth-back", onclick: function () { authStep = "email"; authMsg = ""; authDetail = ""; renderAuth(); }, text: "Use a different email" }));
   }
   card.append(row);
   wrap.append(card);
