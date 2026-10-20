@@ -705,7 +705,7 @@ function joinView() {
       h("dl", { class: "stats" },
         h("div", null, h("dt", { text: "Event date" }), h("dd", { text: fmtDay(joinInfo.event_date) })),
         h("div", null, h("dt", { text: "Members so far" }), h("dd", { text: String(joinInfo.member_count) })))),
-    joinInfo.archived && !already ? h("div", { class: "note warn" }, icon("lock"), h("span", { text: "This group is archived and closed to new members." })) : null,
+    joinInfo.archived && !already ? h("div", { class: "note warn" }, icon("lock"), h("span", { text: "This group is archived and closed to new members." })) : "",
     err,
     h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, btn,
       h("button", { class: "btn ghost", type: "button", id: "join-cancel", onclick: function () { finishJoinLink(); route = { name: "dashboard" }; renderMain(); }, text: "Not now" })));
