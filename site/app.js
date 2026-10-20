@@ -480,10 +480,15 @@ async function submitList() {
   try {
     await persistItems(r.complete);
     if (first) await api(sb.rpc("submit_list", { p_group: route.id }));
+    // A list made for someone else: the first time it has items, the rest of the group is emailed once.
+    var announced = false;
+    if (editor.owner !== myId && !isRegistry() && r.complete.length) {
+      try { announced = (await api(sb.rpc("announce_child_list", { p_group: route.id, p_member: editor.owner }))) === true; } catch (e) { announced = false; }
+    }
     editor.showErrors = false;
     await afterSave();
     await loadGroups();
-    toast(first ? "Your list is live. The group has been emailed." : "Changes saved.");
+    toast(first ? "Your list is live. The group has been emailed." : announced ? "Saved. The group has been emailed about " + possessive(editor.owner) + " list." : "Changes saved.");
   } catch (e) { toast(humanize(e)); }
   editor.saving = false;
   renderPanel(); updateTabs();

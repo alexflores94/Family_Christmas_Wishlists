@@ -101,9 +101,12 @@ create table if not exists public.wish_lists (
   owner        uuid not null,
   submitted_at timestamptz,
   updated_at   timestamptz not null default now(),
+  -- when the group was emailed about this list (used for lists made for someone else)
+  notified_at  timestamptz,
   primary key (group_id, owner),
   foreign key (group_id, owner) references public.group_members(group_id, member_id) on delete cascade
 );
+alter table public.wish_lists add column if not exists notified_at timestamptz;
 
 create table if not exists public.wish_items (
   id          uuid primary key default gen_random_uuid(),
@@ -425,7 +428,7 @@ begin
   select name into v_who   from public.profiles where id = p_owner;
   select name into v_group from public.groups   where id = p_group;
   select count(*) into v_n from public.wish_items where group_id = p_group and owner = p_owner;
-  select array_agg(p.email order by p.email) into v_to from public.group_members m join public.profiles p on p.id = m.member_id where m.group_id = p_group and m.member_id <> p_owner;
+  select array_agg(p.email order by p.email) into v_to from public.group_members m join public.profiles p on p.id = m.member_id where m.group_id = p_group and m.member_id <> p_owner and not m.is_recipient;
   perform public.send_mail(
     v_to,
     coalesce(v_who, 'Someone') || ' shared a wishlist in ' || coalesce(v_group, 'your group'),
@@ -433,6 +436,35 @@ begin
       public.esc(coalesce(v_who, 'Someone')) || ' shared a list',
       public.esc(coalesce(v_who, 'Someone')) || ' just submitted a wishlist with ' || v_n || case when v_n = 1 then ' item' else ' items' end
         || ' in ' || public.esc(coalesce(v_group, 'your group')) || '. Open it to see what they would like, and mark anything you buy so nobody doubles up.',
+      'Open the wishlist')
+  );
+end
+$$;
+
+-- Email the group about a list someone made for another person (a child, say). Real members only, not the author.
+create or replace function public.notify_child_list(p_group uuid, p_member uuid, p_author uuid)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_author text; v_for text; v_group text; v_n int; v_to text[];
+begin
+  select name into v_author from public.profiles where id = p_author;
+  select name into v_for    from public.profiles where id = p_member;
+  select name into v_group  from public.groups   where id = p_group;
+  select count(*) into v_n from public.wish_items where group_id = p_group and owner = p_member;
+  select array_agg(p.email order by p.email) into v_to
+    from public.group_members m join public.profiles p on p.id = m.member_id
+   where m.group_id = p_group and m.member_id <> p_author and not m.is_recipient;
+  perform public.send_mail(
+    v_to,
+    coalesce(v_author, 'Someone') || ' shared a wishlist for ' || coalesce(v_for, 'someone') || ' in ' || coalesce(v_group, 'your group'),
+    public.mail_html(
+      public.esc(coalesce(v_author, 'Someone')) || ' shared a list for ' || public.esc(coalesce(v_for, 'someone')),
+      public.esc(coalesce(v_author, 'Someone')) || ' just shared a wishlist for ' || public.esc(coalesce(v_for, 'someone')) || ' with ' || v_n
+        || case when v_n = 1 then ' item' else ' items' end || ' in ' || public.esc(coalesce(v_group, 'your group'))
+        || '. Open it to see what they would like, and mark anything you buy so nobody doubles up.',
       'Open the wishlist')
   );
 end
@@ -746,6 +778,29 @@ begin
 end
 $$;
 
+-- Called after the author saves items on a list they made for someone else. The first time the list has
+-- items, the rest of the group is emailed once. Returns true when an email went out.
+create or replace function public.announce_child_list(p_group uuid, p_member uuid)
+returns boolean
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare m uuid := public.my_id();
+begin
+  if m is null or not exists (select 1 from public.group_members x
+                              where x.group_id = p_group and x.member_id = p_member and x.is_recipient and x.managed_by = m) then
+    raise exception 'That list is not yours to change';
+  end if;
+  if not public.group_open(p_group) then raise exception 'This group is archived, so lists are closed'; end if;
+  if not exists (select 1 from public.wish_items where group_id = p_group and owner = p_member) then return false; end if;
+  update public.wish_lists set notified_at = now()
+   where group_id = p_group and owner = p_member and notified_at is null;
+  if not found then return false; end if;
+  perform public.notify_child_list(p_group, p_member, m);
+  return true;
+end
+$$;
+
 -- Deletes a list made for someone else, with everything on it. Only the member who made it (or the group admin).
 create or replace function public.delete_child_list(p_group uuid, p_member uuid)
 returns void
@@ -1020,7 +1075,7 @@ grant execute on function
   public.join_group(text), public.generate_invite(uuid), public.set_group_archived(uuid, boolean), public.submit_list(uuid),
   public.today_local(), public.sweep_archives(), public.edit_group(uuid, text, date), public.remove_member(uuid, uuid),
   public.can_edit_items(uuid, uuid), public.create_registry(text, date, text), public.add_list(uuid, text), public.rename_list(uuid, uuid, text),
-  public.add_child_list(uuid, text), public.delete_child_list(uuid, uuid)
+  public.add_child_list(uuid, text), public.delete_child_list(uuid, uuid), public.announce_child_list(uuid, uuid)
   to authenticated;
 grant execute on function public.preview_invite(text) to anon, authenticated;
 
