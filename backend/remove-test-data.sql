@@ -1,5 +1,6 @@
--- Removes ALL lists, items and purchases. Run this once after testing, before the family starts.
--- Do not run it later: it erases real lists too. Family emails and settings are kept.
-delete from public.purchases;
-delete from public.lists;
-delete from public.items;
+-- Removes ALL wishlist items, shared lists and purchase marks in EVERY group.
+-- Groups, members and settings are kept. Run it once after testing, before real use.
+-- Do not run it later: it erases real lists too.
+delete from public.claims;
+delete from public.wish_items;
+delete from public.wish_lists;

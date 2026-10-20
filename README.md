@@ -1,4 +1,4 @@
-# Family Wishlist: setup guide
+# Wishlist Groups: setup guide
 
 About 40 minutes, no coding. Everything below has a free plan.
 
@@ -6,9 +6,18 @@ About 40 minutes, no coding. Everything below has a free plan.
 
 | Piece | Job | Where it lives |
 |---|---|---|
-| The website | The pages your family uses | GitHub Pages (`site/` folder) |
-| The database | Stores lists and purchases, hides purchases from the list owner, signs people in with an emailed code | Supabase |
+| The website | The pages people use | Vercel (the `site/` folder) |
+| The database | Stores groups, lists and purchases, hides purchases from the list owner, signs people in with an emailed code | Supabase |
 | The mailer | Sends "Jorge shared his list" and the 3-day reminders | A small Google Apps Script on your Gmail |
+
+## Upgrading from the single-family version
+
+If the family site already works, you only need two steps:
+
+1. In Supabase open **SQL Editor > New query**, paste all of `backend/setup.sql`, and click **Run**. No edits are needed. Your settings are kept. The five family members, their lists and their purchases move into a group called **Family Christmas** (event date Dec 25, minimum 3, Alex is the admin). The old tables stay as a backup named `legacy_*`.
+2. Push the new `site/` files. Vercel redeploys on its own.
+
+Everyone signs in with the same emails as before and finds Family Christmas on their dashboard.
 
 ## Two folders, two rules
 
@@ -17,9 +26,13 @@ About 40 minutes, no coding. Everything below has a free plan.
 
 ## What happens, and when
 
-- Sign in: type your email, get a 6-digit code, type it in. Only the five family emails work.
-- A person submits their list: the other four get an email.
-- Reminders: every 3 days starting Thanksgiving, at 9:00 AM Pacific, to anyone who has not submitted. For 2026 that is Nov 26, Nov 29, Dec 2, 5, 8, 11, 14, 17, 20 and 23. It stops once a person submits, and never sends on or after Dec 25.
+- **Sign in:** type your email, get a 6-digit code, type it in. Anyone with an invite link can create an account the same way.
+- **Groups:** anyone signed in can create a group with a name, event date and item minimum. The creator is its admin.
+- **Invite link:** the admin copies a link from the group's Manage tab. Opening it asks for an email, then a name for new people, then to join. A new link switches the old one off.
+- **Archive:** the admin can archive a group. No one can join it and no one can add or edit lists. Purchases can still be marked. The admin can reopen it.
+- **Quantity:** each wish can have a quantity (default 1) or Unlimited. A wish with more than one stays available to others until every one is claimed, and shows who else picked it up.
+- **Dashboard:** every group you are in, its created date, member count, and how many people you still have no purchase marked for.
+- **Emails:** when someone submits a list, the rest of that group is emailed. Every 3rd day starting 29 days before the group's event date (Thanksgiving for a Dec 25 event in 2026), at 9:00 AM Pacific, anyone in an open group who has not submitted is reminded. It stops the day before the event.
 
 ---
 
@@ -65,38 +78,37 @@ Gmail's free limit is roughly 100 recipients a day, far more than this site uses
 
 ## Step 4. Set up the database
 
-1. Open `backend/setup.sql` in any text editor.
-2. **EDIT ME 1:** replace the five `PUT-...-EMAIL-HERE@example.com` values with each person's email. Use the address they will type to sign in. Keep the names `alex`, `jorge`, and so on exactly as they are.
-3. **EDIT ME 2:** replace the three settings:
-   - `site_url`: leave it for now, you will fix it in Step 6
+1. In `backend/setup.sql`, find the block marked **EDIT ME** and replace its three settings:
+   - `site_url`: your site's address, such as `https://floreswishlists.vercel.app/`
    - `mailer_url`: the Apps Script web app URL from Step 3
    - `mailer_secret`: the same secret string you put in the script
-4. In Supabase open **SQL Editor > New query**, paste the whole edited file, and click **Run**. You should see "Success". If it complains about `pg_cron` or `pg_net`, open **Database > Extensions**, switch both on, and run it again.
+2. In Supabase open **SQL Editor > New query**, paste the whole edited file, and click **Run**. You should see "Success". If it complains about `pg_cron` or `pg_net`, open **Database > Extensions**, switch both on, and run it again.
 
-Running it again later is safe. It never deletes lists.
+Running it again is safe. It never deletes lists, and it never overwrites settings that are already filled in. To change a setting later, run `update public.app_settings set value = '...' where key = 'site_url';` (or `mailer_url`, `mailer_secret`).
 
-## Step 5. Put the website on GitHub Pages
+Keep a copy with your real secret on your own computer, not in this repo.
 
-1. Open `site/config.js` and paste in your Project URL and anon key from Step 1.
-2. On github.com click **New repository**. Name it (for example `family-wishlist`), choose **Public**, and create it.
-3. Click **Add file > Upload files** and drag in the three files from `site/`: `index.html`, `app.js`, `config.js`. Commit. Do not upload anything from `backend/`. (This repo is private, and GitHub Pages on a private repo needs a paid GitHub plan, so on a free account use a separate public repo that holds only these three files.)
-4. Open **Settings > Pages**. Under Source choose **Deploy from a branch**, branch `main`, folder `/ (root)`, and Save. After a minute the page shows your address, such as `https://yourname.github.io/family-wishlist/`.
+## Step 5. Put the website on Vercel
+
+1. Open `site/config.js` and paste in your Project URL and anon (publishable) key from Step 1.
+2. In Vercel choose **Add New > Project**, import this repository, and set **Root Directory** to `site`. Leave Framework as **Other** and leave the build and output settings empty. Deploy.
+3. Every push to `main` redeploys the site.
 
 ## Step 6. Tell the database the website address
 
 In Supabase SQL Editor run this, using your real address:
 
 ```sql
-update public.app_settings set value = 'https://yourname.github.io/family-wishlist/' where key = 'site_url';
+update public.app_settings set value = 'https://floreswishlists.vercel.app/' where key = 'site_url';
 ```
 
 The emails use it for their "Open the wishlist" button.
 
-## Step 7. Test it, then clear the test data
+## Step 7. Test it
 
-1. Optional: run `backend/optional-test-data.sql` in the SQL Editor. It loads last year's lists for Jorge, Brianne, Mom and Dad and leaves Alex's as a draft, so you can try everything.
-2. Open your site and sign in with your own email. You should get a code within a minute or so. Check spam the first time.
-3. Try: submit Alex's draft (the other four should get an email), mark items purchased on someone's list, and look at the Purchases tab.
+1. Open your site and sign in with your email. You should get a code within a minute or so. Check spam the first time.
+2. Create a group, copy its invite link from the Manage tab, and open the link in a private window to try joining as a second person.
+3. Add a few wishes (try a quantity of 3 and Unlimited), submit, and mark purchases from the other account.
 4. To check the mailer on its own, run this with your own address:
 
 ```sql
@@ -104,16 +116,16 @@ select public.send_mail(array['you@example.com'], 'Test', '<p>It works</p>');
 ```
 
    If nothing arrives, look at Executions in the Apps Script project, and run `select * from net._http_response order by created desc limit 5;` in Supabase.
-5. When you are done, run `backend/remove-test-data.sql`. **Do it before the family starts**, because it erases every list.
-6. Send the family the site address.
+5. To wipe test lists before real use, run `backend/remove-test-data.sql`. It erases every list in every group.
 
 ---
 
 ## Good to know
 
 - **Purchases are hidden by the database.** The list owner's account is refused those rows, so they cannot be found by looking at the page's code. The Purchases tab only ever shows gifts you bought for other people.
-- **Deleting an item that someone already bought** removes their purchase mark too.
-- **Changing an email:** `update public.member_emails set email = 'new@example.com' where key = 'mom';` (use the person's key).
+- **Deleting an item that someone already bought** removes their purchase marks too.
+- **Anyone with the site address can create an account**, but they can only see groups they have joined. Names of fellow group members, and their emails, are visible to people in the same group.
+- **Changing someone's email:** their account is tied to the email they sign in with, so they should sign in with the new address and join the group again through its invite link.
 - **Free Supabase projects can pause when nobody uses them for a while.** If the site stops loading, open the Supabase dashboard and restore the project.
-- **Reminders run from the database.** To try one by hand, `select public.send_reminders('2026-11-29');` pretends today is Nov 29 and really emails everyone who has not submitted, so only run it when that is fine.
-- **Emails come from your Gmail address**, for both the sign-in codes and the notifications.
+- **Reminders run from the database.** To try one by hand, `select public.send_reminders('2026-11-26');` pretends today is Nov 26 and really emails everyone who has not submitted in any group whose reminder day that is, so only run it when that is fine.
+- **Emails come from your Gmail address**, for both the sign-in codes and the notifications. Gmail's free limit is roughly 100 recipients a day, so very large groups could hit it.
