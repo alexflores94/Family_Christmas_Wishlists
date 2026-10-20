@@ -116,6 +116,17 @@ create table if not exists public.claims (
   primary key (item_id, buyer)
 );
 
+-- What a shopper paid for an item they claimed. Private to that shopper: nobody else,
+-- including the list's owner and the other shoppers, can read it.
+create table if not exists public.claim_prices (
+  item_id    uuid not null,
+  buyer      uuid not null,
+  amount     numeric(10, 2) not null check (amount >= 0 and amount < 10000000),
+  updated_at timestamptz not null default now(),
+  primary key (item_id, buyer),
+  foreign key (item_id, buyer) references public.claims(item_id, buyer) on delete cascade
+);
+
 -- ---------------------------------------------------------------------------
 -- Who is signed in, and what can they do?
 -- ---------------------------------------------------------------------------
@@ -535,6 +546,7 @@ alter table public.group_members enable row level security;
 alter table public.wish_lists    enable row level security;
 alter table public.wish_items    enable row level security;
 alter table public.claims        enable row level security;
+alter table public.claim_prices  enable row level security;
 
 drop policy if exists profiles_read on public.profiles;
 create policy profiles_read on public.profiles
@@ -599,6 +611,27 @@ create policy claims_insert on public.claims
 drop policy if exists claims_delete on public.claims;
 create policy claims_delete on public.claims
   for delete to authenticated using (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
+
+-- Prices paid: only the shopper who paid can see or change them, and not once the group is archived.
+drop policy if exists prices_read on public.claim_prices;
+create policy prices_read on public.claim_prices
+  for select to authenticated using (buyer = public.my_id());
+
+drop policy if exists prices_insert on public.claim_prices;
+create policy prices_insert on public.claim_prices
+  for insert to authenticated
+  with check (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
+
+drop policy if exists prices_update on public.claim_prices;
+create policy prices_update on public.claim_prices
+  for update to authenticated
+  using (buyer = public.my_id() and public.group_open(public.item_group(item_id)))
+  with check (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
+
+drop policy if exists prices_delete on public.claim_prices;
+create policy prices_delete on public.claim_prices
+  for delete to authenticated
+  using (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
 
 -- ---------------------------------------------------------------------------
 -- Upgrade from the single-family version (runs once, only if the old tables exist)
@@ -687,6 +720,7 @@ grant select on public.groups, public.group_invites, public.group_members, publi
 grant select (id, name) on public.profiles to authenticated;
 grant select, insert, update, delete on public.wish_items to authenticated;
 grant select, insert, delete on public.claims to authenticated;
+grant select, insert, update, delete on public.claim_prices to authenticated;
 
 revoke all on all functions in schema public from public, anon, authenticated;
 grant execute on function

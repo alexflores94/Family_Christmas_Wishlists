@@ -106,6 +106,10 @@ function countdownText(s) {
   if (d === 0) return "Today!";
   return "Event has passed";
 }
+function toCents(n) { return Math.round(Number(n) * 100); }
+function fmtMoney(cents) {
+  return "$" + (cents / 100).toLocaleString(undefined, { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+}
 function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
 function humanize(err) {
   var m = (err && err.message) || "";
@@ -141,6 +145,7 @@ async function loadGroup() {
     sb.from("wish_lists").select("owner,submitted_at").eq("group_id", id),
     sb.from("wish_items").select("id,owner,name,description,link,price,price_as_of,quantity,position,created_at").eq("group_id", id).order("position").order("created_at"),
     sb.from("claims").select("item_id,buyer"),
+    sb.from("claim_prices").select("item_id,amount"),
     isAdmin() ? sb.from("group_invites").select("code").eq("group_id", id) : Promise.resolve({ data: [] })
   ]);
   for (var i = 0; i < res.length; i++) if (res[i].error) throw res[i].error;
@@ -164,9 +169,10 @@ async function loadGroup() {
     id: id, members: memberIds, names: names,
     listMeta: new Map((res[2].data || []).map(function (r) { return [r.owner, r]; })),
     items: items, claimers: claimers,
-    code: (res[5].data && res[5].data[0] && res[5].data[0].code) || ""
+    code: (res[6].data && res[6].data[0] && res[6].data[0].code) || "",
+    paid: new Map((res[5].data || []).filter(function (r) { return known.has(r.item_id); }).map(function (r) { return [r.item_id, Number(r.amount)]; }))
   };
-  var s = JSON.stringify([memberIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code]);
+  var s = JSON.stringify([memberIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code, Array.from(next.paid)]);
   var changed = s !== lastDataSig;
   lastDataSig = s;
   gd = next;
@@ -442,6 +448,38 @@ async function submitList() {
   } catch (e) { toast(humanize(e)); }
   editor.saving = false;
   renderPanel(); updateTabs();
+}
+async function savePaid(item, input) {
+  var raw = input.value.trim();
+  var had = gd.paid.has(item.id);
+  function revert() { input.value = had ? gd.paid.get(item.id).toFixed(2) : ""; }
+  if (isArchived()) { toast("This group is archived, so nothing can be changed."); revert(); return; }
+  try {
+    if (raw === "") {
+      if (!had) return;
+      await api(sb.from("claim_prices").delete().eq("item_id", item.id).eq("buyer", myId));
+      gd.paid.delete(item.id);
+    } else {
+      var n = Number(raw);
+      if (!isFinite(n) || n < 0 || n >= 10000000) { toast("Enter the amount you paid, like 24.99."); revert(); return; }
+      n = toCents(n) / 100;
+      if (had && gd.paid.get(item.id) === n) { input.value = n.toFixed(2); return; }
+      await api(sb.from("claim_prices").upsert({ item_id: item.id, buyer: myId, amount: n }));
+      gd.paid.set(item.id, n);
+      input.value = n.toFixed(2);
+    }
+    toast("Price saved. Only you can see it.");
+    if (route.view === "purchases") renderPanel();
+  } catch (e) { toast(humanize(e)); revert(); }
+}
+function paidInput(item) {
+  var frozen = isArchived();
+  var input = h("input", { type: "number", min: "0", step: "0.01", inputmode: "decimal", placeholder: "0.00", class: "paid-input", "data-paid": item.name,
+    "aria-label": "Price you paid for " + item.name, disabled: frozen ? true : null,
+    value: gd.paid.has(item.id) ? gd.paid.get(item.id).toFixed(2) : "" });
+  input.addEventListener("change", function () { savePaid(item, input); });
+  input.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); input.blur(); } });
+  return h("label", { class: "paid", title: "Only you can see what you paid" }, "Paid $", input);
 }
 async function toggleBought(item, btn) {
   if (isArchived()) { toast("This group is archived, so nothing can be changed."); return; }
@@ -947,7 +985,7 @@ function claimSide(it) {
   function onclick(e) { toggleBought(it, e.currentTarget); }
   if (mine) {
     side.append(h("button", { class: "buy mine", type: "button", "aria-pressed": "true", "aria-label": "Purchased by you. Undo for " + it.name,
-      disabled: frozen ? true : null, title: frozen ? "This group is archived" : null, onclick: onclick }, h("span", { class: "box" }, icon("check")), "Purchased by you"));
+      disabled: frozen ? true : null, title: frozen ? "This group is archived" : null, onclick: onclick }, h("span", { class: "box" }, icon("check")), "Purchased by you"), paidInput(it));
   } else if (full) {
     side.append(h("span", { class: "pill" }, icon("check"), it.quantity === 1 ? "Purchased by " + nameOf(cl[0]) : "All " + it.quantity + " claimed"));
   } else {
@@ -995,9 +1033,14 @@ function purchasesView() {
   gd.members.forEach(function (m) {
     if (m === myId) return;
     var info = listFor(m); if (info.state !== "ready") return;
-    data.push({ member: m, total: info.items.length, bought: info.items.filter(iBought) });
+    var bought = info.items.filter(iBought);
+    var cents = 0, priced = 0;
+    bought.forEach(function (it) { if (gd.paid.has(it.id)) { cents += toCents(gd.paid.get(it.id)); priced++; } });
+    data.push({ member: m, total: info.items.length, bought: bought, cents: cents, priced: priced });
   });
   var n = data.reduce(function (s, p) { return s + p.bought.length; }, 0);
+  var grand = data.reduce(function (s, p) { return s + p.cents; }, 0);
+  var unpriced = data.reduce(function (s, p) { return s + p.bought.length - p.priced; }, 0);
   var withGifts = data.filter(function (p) { return p.bought.length; });
   var without = data.filter(function (p) { return !p.bought.length; });
   var wrap = h("div", { class: "panel" });
@@ -1009,13 +1052,20 @@ function purchasesView() {
       h("button", { class: "btn sm", type: "button", onclick: function () { setView("members"); }, text: "Browse lists" })));
     return wrap;
   }
+  wrap.append(h("div", { class: "card", id: "grand-total" },
+    h("div", { class: "prog-row" }, h("span", { text: "Total spent on all lists" }), h("span", { text: plural(withGifts.length, "list", "lists") })),
+    h("div", { class: "total", id: "grand-amount", text: fmtMoney(grand) }),
+    h("p", { class: "muted", style: "font-size:13px;margin-top:4px", text: unpriced
+      ? plural(unpriced, "purchase doesn’t", "purchases don’t") + " have a price yet. Add what you paid below. Only you can see these amounts."
+      : "Only you can see these amounts." })));
   withGifts.forEach(function (p) {
     var rows = p.bought.map(function (it) {
-      return h("li", { class: "buyrow" }, h("span", { class: "bn", text: it.name }), h("span", { class: "muted bp", text: it.price || "" }));
+      return h("li", { class: "buyrow" }, h("span", { class: "bn", text: it.name }), paidInput(it));
     });
-    wrap.append(h("div", { class: "card" },
+    wrap.append(h("div", { class: "card", "data-list": p.member },
       h("div", { class: "who-head" }, avatar(p.member, "md"),
-        h("div", { style: "flex:1;min-width:0" }, h("h3", { text: nameOf(p.member) }), h("p", { class: "muted", text: p.bought.length + " of " + p.total + " bought" }))),
+        h("div", { style: "flex:1;min-width:0" }, h("h3", { text: nameOf(p.member) }), h("p", { class: "muted", text: p.bought.length + " of " + p.total + " bought" })),
+        h("div", { class: "list-total", "data-total": "list", text: fmtMoney(p.cents) })),
       h("ul", { class: "buylist" }, rows),
       h("button", { class: "btn sm ghost", type: "button", onclick: function () { setView("member:" + p.member); }, text: "Open " + possessive(p.member) + " list" })));
   });

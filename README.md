@@ -33,6 +33,7 @@ Everyone signs in with the same emails as before and finds Family Christmas on t
 - **Invite link:** the admin copies a link from the group's Manage tab. Opening it asks for an email, then a name for new people, then to join. A new link switches the old one off.
 - **Archive:** the admin can archive a group. It moves to an **Archived** tab on everyone's dashboard and becomes view-only: no one can join, add or edit lists, or mark purchases, and the buttons are greyed out. Only the admin can reopen it.
 - **Quantity:** each wish can have a quantity (default 1) or Unlimited. A wish with more than one stays available to others until every one is claimed, and shows who else picked it up.
+- **Prices paid:** on any item you've picked you can enter what you paid. The Purchases tab totals it per list and across all lists. Only you can see your prices; not the list's owner, and not other shoppers.
 - **Dashboard:** every group you are in, its created date, member count, and how many people you still have no purchase marked for.
 - **Emails:** when someone submits a list, the rest of that group is emailed. There are no reminder emails.
 
