@@ -8,7 +8,7 @@ About 40 minutes, no coding. Everything below has a free plan.
 |---|---|---|
 | The website | The pages people use | Vercel (the `site/` folder) |
 | The database | Stores groups, lists and purchases, hides purchases from the list owner, signs people in with an emailed code | Supabase |
-| The mailer | Sends "Jorge shared his list" and the 3-day reminders | A small Google Apps Script on your Gmail |
+| The mailer | Sends the "Jorge shared his list" emails | A small Google Apps Script on your Gmail |
 
 ## Upgrading from the single-family version
 
@@ -34,7 +34,7 @@ Everyone signs in with the same emails as before and finds Family Christmas on t
 - **Archive:** the admin can archive a group. It moves to an **Archived** tab on everyone's dashboard and becomes view-only: no one can join, add or edit lists, or mark purchases, and the buttons are greyed out. Only the admin can reopen it.
 - **Quantity:** each wish can have a quantity (default 1) or Unlimited. A wish with more than one stays available to others until every one is claimed, and shows who else picked it up.
 - **Dashboard:** every group you are in, its created date, member count, and how many people you still have no purchase marked for.
-- **Emails:** when someone submits a list, the rest of that group is emailed. Every 3rd day starting 29 days before the group's event date (Thanksgiving for a Dec 25 event in 2026), at 9:00 AM Pacific, anyone in an open group who has not submitted is reminded. It stops the day before the event.
+- **Emails:** when someone submits a list, the rest of that group is emailed. There are no reminder emails.
 
 ---
 
@@ -84,7 +84,7 @@ Gmail's free limit is roughly 100 recipients a day, far more than this site uses
    - `site_url`: your site's address, such as `https://floreswishlists.vercel.app/`
    - `mailer_url`: the Apps Script web app URL from Step 3
    - `mailer_secret`: the same secret string you put in the script
-2. In Supabase open **SQL Editor > New query**, paste the whole edited file, and click **Run**. You should see "Success". If it complains about `pg_cron` or `pg_net`, open **Database > Extensions**, switch both on, and run it again.
+2. In Supabase open **SQL Editor > New query**, paste the whole edited file, and click **Run**. You should see "Success". If it complains about `pg_net`, open **Database > Extensions**, switch it on, and run it again.
 
 Running it again is safe. It never deletes lists, and it never overwrites settings that are already filled in. To change a setting later, run `update public.app_settings set value = '...' where key = 'site_url';` (or `mailer_url`, `mailer_secret`).
 
@@ -130,5 +130,4 @@ select public.send_mail(array['you@example.com'], 'Test', '<p>It works</p>');
 - **Anyone with the site address can create an account**, but they can only see groups they have joined.
 - **Changing someone's email:** their account is tied to the email they sign in with, so they should sign in with the new address and join the group again through its invite link.
 - **Free Supabase projects can pause when nobody uses them for a while.** If the site stops loading, open the Supabase dashboard and restore the project.
-- **Reminders run from the database.** To try one by hand, `select public.send_reminders('2026-11-26');` pretends today is Nov 26 and really emails everyone who has not submitted in any group whose reminder day that is, so only run it when that is fine.
 - **Emails come from your Gmail address**, for both the sign-in codes and the notifications. Gmail's free limit is roughly 100 recipients a day, so very large groups could hit it.

@@ -14,7 +14,6 @@
 -- ============================================================================
 
 create extension if not exists pg_net;
-create extension if not exists pg_cron;
 
 -- This script replaces the short-lived first version of the groups schema. If that
 -- version was already installed, stop here instead of damaging its data.
@@ -359,46 +358,6 @@ begin
 end
 $$;
 
--- Runs every morning. For each open group, it reminds members who have not
--- submitted a list every 3rd day, starting 29 days before the event, up to the
--- day before it. (29 days before Dec 25 is Thanksgiving in 2026.)
-create or replace function public.send_reminders(p_today date default null)
-returns void
-language plpgsql security definer
-set search_path = public, pg_temp
-as $$
-declare
-  d     date := coalesce(p_today, (now() at time zone 'America/Los_Angeles')::date);
-  g     record;
-  v_to  text[];
-  v_in  int;
-  v_all int;
-begin
-  for g in select id, name, event_date from public.groups where archived_at is null and event_date > d loop
-    if d < g.event_date - 29 or (d - (g.event_date - 29)) % 3 <> 0 then continue; end if;
-
-    select array_agg(p.email order by p.email) into v_to
-    from public.group_members m join public.profiles p on p.id = m.member_id
-    where m.group_id = g.id and not public.list_submitted(g.id, m.member_id);
-    if v_to is null then continue; end if;
-
-    select count(*) into v_all from public.group_members where group_id = g.id;
-    v_in := v_all - array_length(v_to, 1);
-
-    perform public.send_mail(
-      v_to,
-      'Reminder: add your wishlist to ' || g.name,
-      public.mail_html(
-        'Your wishlist is not in yet',
-        v_in || ' of ' || v_all || ' lists are in for ' || public.esc(g.name) || ', and it is ' || (g.event_date - d)
-          || case when g.event_date - d = 1 then ' day' else ' days' end
-          || ' away. Add your wishes and submit your list so everyone can start shopping.',
-        'Add my wishlist')
-    );
-  end loop;
-end
-$$;
-
 -- ---------------------------------------------------------------------------
 -- Actions the website calls. Each one checks the rules itself.
 -- ---------------------------------------------------------------------------
@@ -739,7 +698,13 @@ grant execute on function
 grant execute on function public.preview_invite(text) to anon, authenticated;
 
 -- ---------------------------------------------------------------------------
--- Daily schedule: 9:00 AM Pacific (17:00 UTC) every day. The function itself
--- decides which groups get a reminder today.
+-- Reminder emails are no longer sent. Switch off the daily job if an earlier version scheduled it.
 -- ---------------------------------------------------------------------------
-select cron.schedule('wishlist-daily-reminders', '0 17 * * *', 'select public.send_reminders();');
+do $unschedule$
+begin
+  perform cron.unschedule('wishlist-daily-reminders');
+exception when others then
+  null;  -- nothing was scheduled
+end
+$unschedule$;
+drop function if exists public.send_reminders(date);
