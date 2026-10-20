@@ -246,6 +246,12 @@ p{margin:0}
   .row2{grid-template-columns:1fr}
   .also{text-align:left;max-width:none}
 }
+.buy[disabled]{opacity:.5;cursor:not-allowed}
+.buy[disabled]:hover{border-color:var(--line-strong);color:inherit}
+.buy.mine[disabled]:hover{border-color:var(--good);color:var(--good)}
+.linkbox input[disabled]{opacity:.55;cursor:not-allowed}
+.gcard.archived{background:var(--surface-2)}
+.gcard.archived h3{color:var(--muted)}
 </style>
 </head>
 <body>

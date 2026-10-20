@@ -16,6 +16,17 @@
 create extension if not exists pg_net;
 create extension if not exists pg_cron;
 
+-- This script replaces the short-lived first version of the groups schema. If that
+-- version was already installed, stop here instead of damaging its data.
+do $guard$
+begin
+  if to_regclass('public.profiles') is not null
+     and not exists (select 1 from information_schema.columns where table_schema = 'public' and table_name = 'profiles' and column_name = 'id') then
+    raise exception 'An earlier groups version is installed. Do not run this file yet; ask for the upgrade script.';
+  end if;
+end
+$guard$;
+
 -- ---------------------------------------------------------------------------
 -- EDIT ME (first-time install only). Re-running never overwrites these once set.
 --   site_url      the address of the published website, e.g. https://floreswishlists.vercel.app/
@@ -37,8 +48,11 @@ on conflict (key) do nothing;
 -- Tables
 -- People are identified by the email they sign in with (verified by the emailed code).
 -- ---------------------------------------------------------------------------
+-- Emails are used only to sign in. Everything the website reads is keyed by the private id,
+-- and the email column cannot be read by signed-in users at all (see Permissions below).
 create table if not exists public.profiles (
-  email      text primary key check (email = lower(email)),
+  id         uuid primary key default gen_random_uuid(),
+  email      text not null unique check (email = lower(email)),
   name       text not null check (length(trim(name)) between 1 and 40),
   created_at timestamptz not null default now()
 );
@@ -48,7 +62,7 @@ create table if not exists public.groups (
   name        text not null check (length(trim(name)) between 1 and 60),
   event_date  date not null,
   item_min    int  not null default 3 check (item_min between 1 and 50),
-  admin_email text not null references public.profiles(email),
+  admin_id    uuid not null references public.profiles(id),
   created_at  timestamptz not null default now(),
   archived_at timestamptz
 );
@@ -62,24 +76,24 @@ create table if not exists public.group_invites (
 
 create table if not exists public.group_members (
   group_id  uuid not null references public.groups(id) on delete cascade,
-  email     text not null references public.profiles(email),
+  member_id uuid not null references public.profiles(id),
   joined_at timestamptz not null default now(),
-  primary key (group_id, email)
+  primary key (group_id, member_id)
 );
 
 create table if not exists public.wish_lists (
   group_id     uuid not null,
-  owner        text not null,
+  owner        uuid not null,
   submitted_at timestamptz,
   updated_at   timestamptz not null default now(),
   primary key (group_id, owner),
-  foreign key (group_id, owner) references public.group_members(group_id, email) on delete cascade
+  foreign key (group_id, owner) references public.group_members(group_id, member_id) on delete cascade
 );
 
 create table if not exists public.wish_items (
   id          uuid primary key default gen_random_uuid(),
   group_id    uuid not null,
-  owner       text not null,
+  owner       uuid not null,
   name        text not null check (length(trim(name)) > 0 and length(name) <= 80),
   description text not null check (length(trim(description)) > 0 and length(description) <= 300),
   link        text check (link is null or (link ~* '^https?://' and length(link) <= 2000)),
@@ -90,7 +104,7 @@ create table if not exists public.wish_items (
   position    int  not null default 0,
   created_at  timestamptz not null default now(),
   updated_at  timestamptz not null default now(),
-  foreign key (group_id, owner) references public.group_members(group_id, email) on delete cascade
+  foreign key (group_id, owner) references public.group_members(group_id, member_id) on delete cascade
 );
 create index if not exists wish_items_owner_idx on public.wish_items(group_id, owner, position);
 
@@ -98,7 +112,7 @@ create index if not exists wish_items_owner_idx on public.wish_items(group_id, o
 -- The list's owner can never read these rows (see policies).
 create table if not exists public.claims (
   item_id    uuid not null references public.wish_items(id) on delete cascade,
-  buyer      text not null,
+  buyer      uuid not null references public.profiles(id),
   created_at timestamptz not null default now(),
   primary key (item_id, buyer)
 );
@@ -114,12 +128,29 @@ as $$
   select nullif(lower(coalesce(auth.jwt() ->> 'email', '')), '')
 $$;
 
+-- Your private member id (null until you have chosen a name).
+create or replace function public.my_id()
+returns uuid
+language sql stable security definer
+set search_path = public, pg_temp
+as $$
+  select id from public.profiles where email = public.me()
+$$;
+
+create or replace function public.my_profile()
+returns table (id uuid, name text)
+language sql stable security definer
+set search_path = public, pg_temp
+as $$
+  select p.id, p.name from public.profiles p where p.email = public.me()
+$$;
+
 create or replace function public.is_member(p_group uuid)
 returns boolean
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
-  select exists (select 1 from public.group_members where group_id = p_group and email = public.me())
+  select exists (select 1 from public.group_members where group_id = p_group and member_id = public.my_id())
 $$;
 
 create or replace function public.is_admin(p_group uuid)
@@ -127,7 +158,7 @@ returns boolean
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
-  select exists (select 1 from public.groups where id = p_group and admin_email = public.me())
+  select exists (select 1 from public.groups where id = p_group and admin_id = public.my_id())
 $$;
 
 create or replace function public.group_open(p_group uuid)
@@ -138,7 +169,7 @@ as $$
   select exists (select 1 from public.groups where id = p_group and archived_at is null)
 $$;
 
-create or replace function public.list_submitted(p_group uuid, p_owner text)
+create or replace function public.list_submitted(p_group uuid, p_owner uuid)
 returns boolean
 language sql stable security definer
 set search_path = public, pg_temp
@@ -146,8 +177,8 @@ as $$
   select exists (select 1 from public.wish_lists where group_id = p_group and owner = p_owner and submitted_at is not null)
 $$;
 
-create or replace function public.item_owner(p_item uuid)
-returns text
+create or replace function public.wish_owner(p_item uuid)
+returns uuid
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
@@ -162,16 +193,16 @@ as $$
   select group_id from public.wish_items where id = p_item
 $$;
 
--- True when p_email is you, or someone who shares at least one group with you.
-create or replace function public.shares_group(p_email text)
+-- True when p_id is you, or someone who shares at least one group with you.
+create or replace function public.shares_group(p_id uuid)
 returns boolean
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
-  select p_email = public.me() or exists (
+  select p_id = public.my_id() or exists (
     select 1 from public.group_members a
     join public.group_members b on a.group_id = b.group_id
-    where a.email = public.me() and b.email = p_email)
+    where a.member_id = public.my_id() and b.member_id = p_id)
 $$;
 
 -- ---------------------------------------------------------------------------
@@ -226,6 +257,9 @@ begin
   select quantity, true into v_qty, v_found from public.wish_items where id = new.item_id for update;
   if not coalesce(v_found, false) then
     raise exception 'That item no longer exists';
+  end if;
+  if not public.group_open(public.item_group(new.item_id)) then
+    raise exception 'This group is archived, so nothing can be changed';
   end if;
   if v_qty is not null and (select count(*) from public.claims where item_id = new.item_id) >= v_qty then
     raise exception 'That item has already been fully claimed';
@@ -298,7 +332,7 @@ begin
 end
 $$;
 
-create or replace function public.notify_submitted(p_group uuid, p_owner text)
+create or replace function public.notify_submitted(p_group uuid, p_owner uuid)
 returns void
 language plpgsql security definer
 set search_path = public, pg_temp
@@ -309,10 +343,10 @@ declare
   v_n     int;
   v_to    text[];
 begin
-  select name into v_who   from public.profiles where email = p_owner;
+  select name into v_who   from public.profiles where id = p_owner;
   select name into v_group from public.groups   where id = p_group;
   select count(*) into v_n from public.wish_items where group_id = p_group and owner = p_owner;
-  select array_agg(email order by email) into v_to from public.group_members where group_id = p_group and email <> p_owner;
+  select array_agg(p.email order by p.email) into v_to from public.group_members m join public.profiles p on p.id = m.member_id where m.group_id = p_group and m.member_id <> p_owner;
   perform public.send_mail(
     v_to,
     coalesce(v_who, 'Someone') || ' shared a wishlist in ' || coalesce(v_group, 'your group'),
@@ -343,9 +377,9 @@ begin
   for g in select id, name, event_date from public.groups where archived_at is null and event_date > d loop
     if d < g.event_date - 29 or (d - (g.event_date - 29)) % 3 <> 0 then continue; end if;
 
-    select array_agg(m.email order by m.email) into v_to
-    from public.group_members m
-    where m.group_id = g.id and not public.list_submitted(g.id, m.email);
+    select array_agg(p.email order by p.email) into v_to
+    from public.group_members m join public.profiles p on p.id = m.member_id
+    where m.group_id = g.id and not public.list_submitted(g.id, m.member_id);
     if v_to is null then continue; end if;
 
     select count(*) into v_all from public.group_members where group_id = g.id;
@@ -390,18 +424,18 @@ language plpgsql security definer
 set search_path = public, pg_temp
 as $$
 declare
-  m text := public.me();
+  m uuid := public.my_id();
   g uuid;
 begin
-  if m is null then raise exception 'Not authenticated'; end if;
-  if not exists (select 1 from public.profiles where email = m) then raise exception 'Add your name first'; end if;
+  if public.me() is null then raise exception 'Not authenticated'; end if;
+  if m is null then raise exception 'Add your name first'; end if;
   if length(trim(coalesce(p_name, ''))) not between 1 and 60 then raise exception 'Enter a group name up to 60 characters'; end if;
   if p_event is null then raise exception 'Choose the event date'; end if;
   if p_min is null or p_min not between 1 and 50 then raise exception 'The item minimum must be between 1 and 50'; end if;
 
-  insert into public.groups (name, event_date, item_min, admin_email)
+  insert into public.groups (name, event_date, item_min, admin_id)
   values (trim(p_name), p_event, p_min, m) returning id into g;
-  insert into public.group_members (group_id, email) values (g, m);
+  insert into public.group_members (group_id, member_id) values (g, m);
   insert into public.group_invites (group_id, code) values (g, substr(replace(gen_random_uuid()::text, '-', ''), 1, 24));
   return g;
 end
@@ -417,15 +451,15 @@ language sql stable security definer
 set search_path = public, pg_temp
 as $$
   select g.id, g.name, g.event_date, g.created_at, g.archived_at,
-         g.admin_email = public.me(), g.item_min,
+         g.admin_id = public.my_id(), g.item_min,
          (select count(*)::int from public.group_members x where x.group_id = g.id),
          (select count(*)::int from public.group_members x
-           where x.group_id = g.id and x.email <> public.me()
+           where x.group_id = g.id and x.member_id <> public.my_id()
              and not exists (select 1 from public.claims c join public.wish_items i on i.id = c.item_id
-                             where i.group_id = g.id and i.owner = x.email and c.buyer = public.me())),
-         public.list_submitted(g.id, public.me())
+                             where i.group_id = g.id and i.owner = x.member_id and c.buyer = public.my_id())),
+         public.list_submitted(g.id, public.my_id())
   from public.groups g
-  join public.group_members gm on gm.group_id = g.id and gm.email = public.me()
+  join public.group_members gm on gm.group_id = g.id and gm.member_id = public.my_id()
   order by (g.archived_at is not null), g.event_date, g.name
 $$;
 
@@ -447,19 +481,19 @@ language plpgsql security definer
 set search_path = public, pg_temp
 as $$
 declare
-  m  text := public.me();
+  m  uuid := public.my_id();
   g  uuid;
   ar timestamptz;
 begin
-  if m is null then raise exception 'Not authenticated'; end if;
-  if not exists (select 1 from public.profiles where email = m) then raise exception 'Add your name first'; end if;
+  if public.me() is null then raise exception 'Not authenticated'; end if;
+  if m is null then raise exception 'Add your name first'; end if;
   select i.group_id, gr.archived_at into g, ar
   from public.group_invites i join public.groups gr on gr.id = i.group_id
   where i.code = p_code;
   if g is null then raise exception 'This invite link is not valid any more'; end if;
-  if exists (select 1 from public.group_members where group_id = g and email = m) then return g; end if;
+  if exists (select 1 from public.group_members where group_id = g and member_id = m) then return g; end if;
   if ar is not null then raise exception 'This group is archived and closed to new members'; end if;
-  insert into public.group_members (group_id, email) values (g, m);
+  insert into public.group_members (group_id, member_id) values (g, m);
   return g;
 end
 $$;
@@ -479,7 +513,8 @@ begin
 end
 $$;
 
--- Admin only. An archived group is closed: no new members, and no lists added or edited.
+-- Admin only. An archived group is frozen: no new members, no lists added or edited, nothing claimed or released.
+-- The admin can reopen it.
 create or replace function public.set_group_archived(p_group uuid, p_archived boolean)
 returns void
 language plpgsql security definer
@@ -497,7 +532,7 @@ language plpgsql security definer
 set search_path = public, pg_temp
 as $$
 declare
-  m          text := public.me();
+  m          uuid := public.my_id();
   n          int;
   v_min      int;
   first_time boolean;
@@ -544,7 +579,7 @@ alter table public.claims        enable row level security;
 
 drop policy if exists profiles_read on public.profiles;
 create policy profiles_read on public.profiles
-  for select to authenticated using (public.shares_group(email));
+  for select to authenticated using (public.shares_group(id));
 
 drop policy if exists groups_read on public.groups;
 create policy groups_read on public.groups
@@ -566,43 +601,45 @@ create policy lists_read on public.wish_lists
 drop policy if exists items_read on public.wish_items;
 create policy items_read on public.wish_items
   for select to authenticated
-  using (public.is_member(group_id) and (owner = public.me() or public.list_submitted(group_id, owner)));
+  using (public.is_member(group_id) and (owner = public.my_id() or public.list_submitted(group_id, owner)));
 
 -- Adding and editing items stops when the group is archived.
 drop policy if exists items_insert on public.wish_items;
 create policy items_insert on public.wish_items
   for insert to authenticated
-  with check (owner = public.me() and public.is_member(group_id) and public.group_open(group_id));
+  with check (owner = public.my_id() and public.is_member(group_id) and public.group_open(group_id));
 
 drop policy if exists items_update on public.wish_items;
 create policy items_update on public.wish_items
   for update to authenticated
-  using (owner = public.me() and public.group_open(group_id))
-  with check (owner = public.me() and public.is_member(group_id) and public.group_open(group_id));
+  using (owner = public.my_id() and public.group_open(group_id))
+  with check (owner = public.my_id() and public.is_member(group_id) and public.group_open(group_id));
 
 drop policy if exists items_delete on public.wish_items;
 create policy items_delete on public.wish_items
-  for delete to authenticated using (owner = public.me() and public.group_open(group_id));
+  for delete to authenticated using (owner = public.my_id() and public.group_open(group_id));
 
--- Claims: never visible to the owner of the item, and nobody can claim their own wishes.
+-- Claims: never visible to the owner of the item, nobody can claim their own wishes,
+-- and nothing can be claimed or released once the group is archived.
 drop policy if exists claims_read on public.claims;
 create policy claims_read on public.claims
   for select to authenticated
-  using (public.is_member(public.item_group(item_id)) and public.item_owner(item_id) <> public.me());
+  using (public.is_member(public.item_group(item_id)) and public.wish_owner(item_id) <> public.my_id());
 
 drop policy if exists claims_insert on public.claims;
 create policy claims_insert on public.claims
   for insert to authenticated
   with check (
-    buyer = public.me()
+    buyer = public.my_id()
     and public.is_member(public.item_group(item_id))
-    and public.item_owner(item_id) <> public.me()
-    and public.list_submitted(public.item_group(item_id), public.item_owner(item_id))
+    and public.group_open(public.item_group(item_id))
+    and public.wish_owner(item_id) <> public.my_id()
+    and public.list_submitted(public.item_group(item_id), public.wish_owner(item_id))
   );
 
 drop policy if exists claims_delete on public.claims;
 create policy claims_delete on public.claims
-  for delete to authenticated using (buyer = public.me());
+  for delete to authenticated using (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
 
 -- ---------------------------------------------------------------------------
 -- Upgrade from the single-family version (runs once, only if the old tables exist)
@@ -610,7 +647,7 @@ create policy claims_delete on public.claims
 do $upgrade$
 declare
   v_group uuid;
-  v_admin text;
+  v_admin uuid;
   v_today date := (now() at time zone 'America/Los_Angeles')::date;
   v_year  int;
   r       record;
@@ -626,31 +663,35 @@ begin
   select lower(me.email), m.name from public.member_emails me join public.members m on m.key = me.key
   on conflict (email) do nothing;
 
-  select lower(me.email) into v_admin
+  select p.id into v_admin
   from public.member_emails me join public.members m on m.key = me.key
+  join public.profiles p on p.email = lower(me.email)
   order by (me.key = 'alex') desc, m.sort limit 1;
 
   if v_admin is not null then
-    insert into public.groups (name, event_date, item_min, admin_email)
+    insert into public.groups (name, event_date, item_min, admin_id)
     values ('Family Christmas', make_date(v_year, 12, 25), 3, v_admin) returning id into v_group;
 
-    insert into public.group_members (group_id, email)
-    select v_group, lower(email) from public.member_emails;
+    insert into public.group_members (group_id, member_id)
+    select v_group, p.id from public.member_emails me join public.profiles p on p.email = lower(me.email);
 
     insert into public.group_invites (group_id, code)
     values (v_group, substr(replace(gen_random_uuid()::text, '-', ''), 1, 24));
 
     insert into public.wish_lists (group_id, owner, submitted_at, updated_at)
-    select v_group, lower(me.email), l.submitted_at, l.updated_at
-    from public.lists l join public.member_emails me on me.key = l.owner;
+    select v_group, p.id, l.submitted_at, l.updated_at
+    from public.lists l join public.member_emails me on me.key = l.owner
+    join public.profiles p on p.email = lower(me.email);
 
     insert into public.wish_items (id, group_id, owner, name, description, link, price, price_as_of, quantity, position, created_at, updated_at)
-    select i.id, v_group, lower(me.email), i.name, i.description, i.link, i.price, i.price_as_of, 1, i.position, i.created_at, i.updated_at
-    from public.items i join public.member_emails me on me.key = i.owner;
+    select i.id, v_group, p.id, i.name, i.description, i.link, i.price, i.price_as_of, 1, i.position, i.created_at, i.updated_at
+    from public.items i join public.member_emails me on me.key = i.owner
+    join public.profiles p on p.email = lower(me.email);
 
     insert into public.claims (item_id, buyer, created_at)
-    select p.item_id, lower(me.email), p.created_at
-    from public.purchases p join public.member_emails me on me.key = p.buyer;
+    select pu.item_id, pr.id, pu.created_at
+    from public.purchases pu join public.member_emails me on me.key = pu.buyer
+    join public.profiles pr on pr.email = lower(me.email);
   end if;
 
   -- Retire the old tables (kept as a backup) and the rules that pointed at them.
@@ -668,6 +709,7 @@ begin
   drop function if exists public.submit_list();
   drop function if exists public.notify_submitted(text);
   drop function if exists public.list_submitted(text);
+  drop function if exists public.item_owner(uuid);
 end
 $upgrade$;
 
@@ -681,14 +723,16 @@ drop function if exists public.only_family_signups();
 grant usage on schema public to authenticated, anon;
 
 revoke all on all tables in schema public from anon, authenticated;
-grant select on public.profiles, public.groups, public.group_invites, public.group_members, public.wish_lists to authenticated;
+grant select on public.groups, public.group_invites, public.group_members, public.wish_lists to authenticated;
+-- Signed-in users can read only the id and name of people they share a group with. Never the email.
+grant select (id, name) on public.profiles to authenticated;
 grant select, insert, update, delete on public.wish_items to authenticated;
 grant select, insert, delete on public.claims to authenticated;
 
 revoke all on all functions in schema public from public, anon, authenticated;
 grant execute on function
-  public.me(), public.is_member(uuid), public.is_admin(uuid), public.group_open(uuid),
-  public.list_submitted(uuid, text), public.item_owner(uuid), public.item_group(uuid), public.shares_group(text),
+  public.me(), public.my_id(), public.my_profile(), public.is_member(uuid), public.is_admin(uuid), public.group_open(uuid),
+  public.list_submitted(uuid, uuid), public.wish_owner(uuid), public.item_group(uuid), public.shares_group(uuid),
   public.set_profile(text), public.create_group(text, date, int), public.my_groups(),
   public.join_group(text), public.generate_invite(uuid), public.set_group_archived(uuid, boolean), public.submit_list(uuid)
   to authenticated;

@@ -19,6 +19,8 @@ If the family site already works, you only need two steps:
 
 Everyone signs in with the same emails as before and finds Family Christmas on their dashboard.
 
+(If you ran an earlier draft of the groups `setup.sql` that was posted before this version, the script stops with a message instead of changing anything. Let Claude know and it will write the upgrade.)
+
 ## Two folders, two rules
 
 - `site/` is the website. It has no secrets and is the only folder that should ever go in a public repository.
@@ -29,7 +31,7 @@ Everyone signs in with the same emails as before and finds Family Christmas on t
 - **Sign in:** type your email, get a 6-digit code, type it in. Anyone with an invite link can create an account the same way.
 - **Groups:** anyone signed in can create a group with a name, event date and item minimum. The creator is its admin.
 - **Invite link:** the admin copies a link from the group's Manage tab. Opening it asks for an email, then a name for new people, then to join. A new link switches the old one off.
-- **Archive:** the admin can archive a group. No one can join it and no one can add or edit lists. Purchases can still be marked. The admin can reopen it.
+- **Archive:** the admin can archive a group. It moves to an **Archived** tab on everyone's dashboard and becomes view-only: no one can join, add or edit lists, or mark purchases, and the buttons are greyed out. Only the admin can reopen it.
 - **Quantity:** each wish can have a quantity (default 1) or Unlimited. A wish with more than one stays available to others until every one is claimed, and shows who else picked it up.
 - **Dashboard:** every group you are in, its created date, member count, and how many people you still have no purchase marked for.
 - **Emails:** when someone submits a list, the rest of that group is emailed. Every 3rd day starting 29 days before the group's event date (Thanksgiving for a Dec 25 event in 2026), at 9:00 AM Pacific, anyone in an open group who has not submitted is reminded. It stops the day before the event.
@@ -124,7 +126,8 @@ select public.send_mail(array['you@example.com'], 'Test', '<p>It works</p>');
 
 - **Purchases are hidden by the database.** The list owner's account is refused those rows, so they cannot be found by looking at the page's code. The Purchases tab only ever shows gifts you bought for other people.
 - **Deleting an item that someone already bought** removes their purchase marks too.
-- **Anyone with the site address can create an account**, but they can only see groups they have joined. Names of fellow group members, and their emails, are visible to people in the same group.
+- **Emails stay private.** People see each other's names only. The database refuses to return anyone's email to a signed-in user, and each person is identified inside the app by a private id.
+- **Anyone with the site address can create an account**, but they can only see groups they have joined.
 - **Changing someone's email:** their account is tied to the email they sign in with, so they should sign in with the new address and join the group again through its invite link.
 - **Free Supabase projects can pause when nobody uses them for a while.** If the site stops loading, open the Supabase dashboard and restore the project.
 - **Reminders run from the database.** To try one by hand, `select public.send_reminders('2026-11-26');` pretends today is Nov 26 and really emails everyone who has not submitted in any group whose reminder day that is, so only run it when that is fine.
