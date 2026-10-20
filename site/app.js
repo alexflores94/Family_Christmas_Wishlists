@@ -898,19 +898,43 @@ function membersView() {
       h("p", { class: "muted", text: isAdmin() ? "Open the Manage tab to copy the invite link and bring people in." : "Ask the group admin for the invite link to share." })));
     return wrap;
   }
+  // How many items I have picked from each list, and which shared lists I haven't touched yet.
+  var mineBy = new Map(), toShop = [], waiting = [];
+  others.forEach(function (m) {
+    var info = listFor(m);
+    if (info.state !== "ready") { waiting.push(m); return; }
+    var n = info.items.filter(iBought).length;
+    mineBy.set(m, n);
+    if (n === 0) toShop.push(m);
+  });
+  var names = function (list) { return list.map(nameOf).join(", "); };
+  if (toShop.length) {
+    wrap.append(h("div", { class: "note warn", id: "shop-note" }, icon("lock"),
+      h("span", { text: "Still to shop for: " + names(toShop) + "." + (waiting.length ? " Waiting on a list from " + names(waiting) + "." : "") })));
+  } else if (mineBy.size) {
+    wrap.append(h("div", { class: "note", id: "shop-note" }, icon("check"),
+      h("span", { text: "You’ve picked something from every shared list." + (waiting.length ? " Waiting on a list from " + names(waiting) + "." : "") })));
+  } else {
+    wrap.append(h("div", { class: "note", id: "shop-note" }, icon("lock"), h("span", { text: "No one has shared a list yet. Waiting on " + names(waiting) + "." })));
+  }
   var grid = h("div", { class: "grid" });
   others.forEach(function (m) {
-    var info = listFor(m), body;
+    var info = listFor(m), body, chip;
     if (info.state === "ready") {
       var bought = info.items.filter(function (it) { return claimersOf(it).length > 0; }).length;
+      var mine = mineBy.get(m);
+      chip = mine > 0
+        ? h("span", { class: "chip", "data-chip": "picked", text: "You’ve picked " + mine + (mine === 1 ? " item" : " items") })
+        : h("span", { class: "chip gold", "data-chip": "to-shop", text: "Not shopped yet" });
       body = h("div", null,
         h("div", { class: "prog-row" }, h("span", { text: plural(info.items.length, "wish", "wishes") }), h("span", { text: bought + " purchased" })),
         h("div", { class: "progress" }, h("b", { style: "width:" + Math.round(bought / info.items.length * 100) + "%" })));
     } else {
+      chip = h("span", { class: "chip grey", "data-chip": "waiting", text: "No list yet" });
       body = h("p", { class: "meta", text: nameOf(m) + " hasn’t submitted a list yet." });
     }
     grid.append(h("button", { class: "tag", type: "button", "data-member": m, disabled: info.state === "ready" ? null : true, onclick: function () { setView("member:" + m); } },
-      h("div", { class: "who" }, avatar(m, "md"), h("h3", { text: nameOf(m) })), body));
+      h("div", { class: "who" }, avatar(m, "md"), h("h3", { text: nameOf(m) })), h("div", { class: "chips" }, chip), body));
   });
   wrap.append(grid);
   return wrap;
