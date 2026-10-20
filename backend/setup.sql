@@ -40,7 +40,9 @@ create table if not exists public.app_settings (
 insert into public.app_settings (key, value) values
   ('site_url',      'https://YOUR-SITE-ADDRESS/'),
   ('mailer_url',    'PASTE-THE-APPS-SCRIPT-WEB-APP-URL-HERE'),
-  ('mailer_secret', 'PASTE-THE-SECRET-HERE')
+  ('mailer_secret', 'PASTE-THE-SECRET-HERE'),
+  -- Groups archive themselves the day after their event date, counted in this time zone.
+  ('timezone',      'America/Los_Angeles')
 on conflict (key) do nothing;
 
 -- ---------------------------------------------------------------------------
@@ -65,6 +67,8 @@ create table if not exists public.groups (
   created_at  timestamptz not null default now(),
   archived_at timestamptz
 );
+-- True when the group was archived because its event date passed (not by the admin).
+alter table public.groups add column if not exists auto_archived boolean not null default false;
 
 -- The join link code. Only the group's admin can read it.
 create table if not exists public.group_invites (
@@ -155,6 +159,23 @@ as $$
   select p.id, p.name from public.profiles p where p.email = public.me()
 $$;
 
+-- Today's date in the group time zone (app_settings.timezone), so an event on the 25th stays open all day on the 25th.
+create or replace function public.today_local()
+returns date
+language plpgsql stable security definer
+set search_path = public, pg_temp
+as $$
+declare tz text;
+begin
+  select value into tz from public.app_settings where key = 'timezone';
+  begin
+    return (now() at time zone coalesce(tz, 'America/Los_Angeles'))::date;
+  exception when others then
+    return (now() at time zone 'America/Los_Angeles')::date;
+  end;
+end
+$$;
+
 create or replace function public.is_member(p_group uuid)
 returns boolean
 language sql stable security definer
@@ -176,7 +197,9 @@ returns boolean
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
-  select exists (select 1 from public.groups where id = p_group and archived_at is null)
+  -- Closed once archived, and also the moment the event date has passed, even before the archive sweep records it.
+  select exists (select 1 from public.groups
+                 where id = p_group and archived_at is null and event_date >= public.today_local())
 $$;
 
 create or replace function public.list_submitted(p_group uuid, p_owner uuid)
@@ -401,6 +424,7 @@ begin
   if m is null then raise exception 'Add your name first'; end if;
   if length(trim(coalesce(p_name, ''))) not between 1 and 60 then raise exception 'Enter a group name up to 60 characters'; end if;
   if p_event is null then raise exception 'Choose the event date'; end if;
+  if p_event < public.today_local() then raise exception 'The event date has already passed. Choose a date that is today or later'; end if;
   if p_min is null or p_min not between 1 and 50 then raise exception 'The item minimum must be between 1 and 50'; end if;
 
   insert into public.groups (name, event_date, item_min, admin_id)
@@ -439,7 +463,7 @@ returns table (group_name text, event_date date, archived boolean, member_count 
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
-  select g.name, g.event_date, g.archived_at is not null,
+  select g.name, g.event_date, (g.archived_at is not null or g.event_date < public.today_local()),
          (select count(*)::int from public.group_members x where x.group_id = g.id)
   from public.group_invites i join public.groups g on g.id = i.group_id
   where i.code = p_code
@@ -457,7 +481,7 @@ declare
 begin
   if public.me() is null then raise exception 'Not authenticated'; end if;
   if m is null then raise exception 'Add your name first'; end if;
-  select i.group_id, gr.archived_at into g, ar
+  select i.group_id, case when gr.event_date < public.today_local() then coalesce(gr.archived_at, now()) else gr.archived_at end into g, ar
   from public.group_invites i join public.groups gr on gr.id = i.group_id
   where i.code = p_code;
   if g is null then raise exception 'This invite link is not valid any more'; end if;
@@ -484,7 +508,7 @@ end
 $$;
 
 -- Admin only. An archived group is frozen: no new members, no lists added or edited, nothing claimed or released.
--- The admin can reopen it.
+-- The admin can reopen it, unless the event date has passed (move the date forward first).
 create or replace function public.set_group_archived(p_group uuid, p_archived boolean)
 returns void
 language plpgsql security definer
@@ -492,7 +516,71 @@ set search_path = public, pg_temp
 as $$
 begin
   if not public.is_admin(p_group) then raise exception 'Only the group admin can do that'; end if;
-  update public.groups set archived_at = case when p_archived then coalesce(archived_at, now()) else null end where id = p_group;
+  if p_archived then
+    update public.groups set archived_at = coalesce(archived_at, now()) where id = p_group;
+  else
+    if exists (select 1 from public.groups where id = p_group and event_date < public.today_local()) then
+      raise exception 'The event date has passed. Change the event date to a day that is today or later to reopen this group';
+    end if;
+    update public.groups set archived_at = null, auto_archived = false where id = p_group;
+  end if;
+end
+$$;
+
+-- Archives every group whose event date has passed. The website calls this whenever it loads, so no scheduler is needed.
+create or replace function public.sweep_archives()
+returns void
+language sql security definer
+set search_path = public, pg_temp
+as $$
+  update public.groups set archived_at = now(), auto_archived = true
+  where archived_at is null and event_date < public.today_local()
+$$;
+
+-- Admin only. Rename the group or move the event date. An archived group is frozen, except that a group which
+-- archived itself because its date passed is reopened by giving it a new date.
+create or replace function public.edit_group(p_group uuid, p_name text, p_event date)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare g public.groups;
+begin
+  if not public.is_admin(p_group) then raise exception 'Only the group admin can do that'; end if;
+  if length(trim(coalesce(p_name, ''))) not between 1 and 60 then raise exception 'Enter a group name up to 60 characters'; end if;
+  if p_event is null then raise exception 'Choose the event date'; end if;
+  if p_event < public.today_local() then raise exception 'The event date has already passed. Choose a date that is today or later'; end if;
+  select * into g from public.groups where id = p_group for update;
+  if g.archived_at is not null and not g.auto_archived and g.event_date >= public.today_local() then
+    raise exception 'This group is archived. Reopen it before making changes';
+  end if;
+  update public.groups
+     set name = trim(p_name), event_date = p_event, archived_at = null, auto_archived = false
+   where id = p_group;
+end
+$$;
+
+-- Admin only. Takes someone out of the group and deletes their list and everything they picked.
+-- They can rejoin only with a valid invite link (make a new link to lock the old one).
+create or replace function public.remove_member(p_group uuid, p_member uuid)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.is_admin(p_group) then raise exception 'Only the group admin can do that'; end if;
+  if not public.group_open(p_group) then raise exception 'This group is archived, so members can no longer be removed'; end if;
+  if p_member = public.my_id() then raise exception 'You are the admin, so you can''t remove yourself'; end if;
+  if not exists (select 1 from public.group_members where group_id = p_group and member_id = p_member) then
+    raise exception 'That person is not in this group';
+  end if;
+  -- Un-submit first so the minimum-items rule lets their items go.
+  delete from public.wish_lists where group_id = p_group and owner = p_member;
+  delete from public.wish_items where group_id = p_group and owner = p_member;
+  -- Release whatever they had picked for others, so those items open up again.
+  delete from public.claims c using public.wish_items i
+   where c.item_id = i.id and i.group_id = p_group and c.buyer = p_member;
+  delete from public.group_members where group_id = p_group and member_id = p_member;
 end
 $$;
 
@@ -727,7 +815,8 @@ grant execute on function
   public.me(), public.my_id(), public.my_profile(), public.is_member(uuid), public.is_admin(uuid), public.group_open(uuid),
   public.list_submitted(uuid, uuid), public.wish_owner(uuid), public.item_group(uuid), public.shares_group(uuid),
   public.set_profile(text), public.create_group(text, date, int), public.my_groups(),
-  public.join_group(text), public.generate_invite(uuid), public.set_group_archived(uuid, boolean), public.submit_list(uuid)
+  public.join_group(text), public.generate_invite(uuid), public.set_group_archived(uuid, boolean), public.submit_list(uuid),
+  public.today_local(), public.sweep_archives(), public.edit_group(uuid, text, date), public.remove_member(uuid, uuid)
   to authenticated;
 grant execute on function public.preview_invite(text) to anon, authenticated;
 

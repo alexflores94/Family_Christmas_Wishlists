@@ -95,6 +95,11 @@ function fmtDay(s) {
   var d = String(s).length > 10 ? new Date(s) : parseDay(s);
   return d.toLocaleDateString(undefined, { month: "short", day: "numeric", year: "numeric" });
 }
+function todayStr() {
+  var n = new Date();
+  return n.getFullYear() + "-" + String(n.getMonth() + 1).padStart(2, "0") + "-" + String(n.getDate()).padStart(2, "0");
+}
+function dateHasPassed(s) { return daysUntil(s) < 0; }
 function daysUntil(s) {
   var now = new Date(), today = new Date(now.getFullYear(), now.getMonth(), now.getDate());
   return Math.round((parseDay(s) - today) / 864e5);
@@ -113,7 +118,7 @@ function fmtMoney(cents) {
 function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
 function humanize(err) {
   var m = (err && err.message) || "";
-  if (/at least \d+ items|archived|only the group admin|not valid any more|add your name|already been fully claimed|group name|item minimum|event date|name up to/i.test(m)) return m.replace(/^ERROR:\s*/, "");
+  if (/at least \d+ items|archived|only the group admin|not valid any more|can.t remove yourself|not in this group|reopen it|has passed|has already passed|add your name|already been fully claimed|group name|item minimum|event date|name up to/i.test(m)) return m.replace(/^ERROR:\s*/, "");
   if (/jwt|expired|not authenticated/i.test(m)) return "You were signed out. Sign in again to keep going.";
   if (/fetch|network|failed to/i.test(m)) return "Couldn’t reach the server. Check your connection and try again.";
   if (/row-level security|permission denied/i.test(m)) return "That isn’t allowed. The group may have been archived.";
@@ -132,6 +137,8 @@ function isArchived() { var g = groupInfo(); return !!(g && g.archived_at); }
 function isAdmin() { var g = groupInfo(); return !!(g && g.is_admin); }
 
 async function loadGroups() {
+  // Groups whose event date has passed archive themselves; do it before reading so every screen agrees.
+  try { await sb.rpc("sweep_archives"); } catch (e) { /* older database: ignore */ }
   groups = (await api(sb.rpc("my_groups"))) || [];
   var s = JSON.stringify(groups), changed = s !== groupsSig;
   groupsSig = s;
@@ -291,13 +298,27 @@ function stopPolling() { if (pollTimer) { clearInterval(pollTimer); pollTimer = 
 async function poll() {
   if (phase !== "ready" || document.visibilityState !== "visible") return;
   try {
+    var wasArchived = isArchived();
     var gch = await loadGroups();
     if (route.name === "dashboard") { if (gch) renderMain(); return; }
     if (route.name === "group") {
+      if (!groupInfo()) {   // the admin removed me from this group
+        editor = null; gd = null; lastDataSig = "";
+        route = { name: "dashboard" }; dashTab = "active";
+        renderMain(); toast("You’re no longer in that group.");
+        return;
+      }
+      if (!wasArchived && isArchived()) {   // its event date passed (or the admin archived it)
+        editor = null;
+        await loadGroup(); renderMain();
+        toast("This group has been archived, so it is now view-only.");
+        return;
+      }
       var ch = await loadGroup();
       if (!ch && !gch) return;
       updateTabs();
-      if (route.view !== "my") renderPanel();   // never rebuild the editor while someone is typing
+      var typing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#d-form");
+      if (route.view !== "my" && !typing) renderPanel();   // never rebuild the editor while someone is typing
     }
   } catch (e) { /* keep showing what we have; the next poll retries */ }
 }
@@ -684,7 +705,7 @@ function newGroupView() {
     h("div", { class: "field" }, h("label", { for: "g-name", text: "Group name" }),
       h("input", { id: "g-name", type: "text", maxlength: "60", placeholder: "Family Christmas, Office swap…", autocomplete: "off", oninput: function (e) { f.name = e.target.value; } })),
     h("div", { class: "field" }, h("label", { for: "g-date", text: "Event date" }),
-      h("input", { id: "g-date", type: "date", oninput: function (e) { f.date = e.target.value; } })),
+      h("input", { id: "g-date", type: "date", min: todayStr(), oninput: function (e) { f.date = e.target.value; } })),
     h("div", { class: "field" }, h("label", { for: "g-min", text: "Minimum items per list" }),
       h("input", { id: "g-min", type: "number", min: "1", max: "50", step: "1", value: "3", inputmode: "numeric", oninput: function (e) { f.min = e.target.value; } }),
       h("p", { class: "muted", style: "font-size:13px", text: "Each person must add at least this many wishes before they can share their list." })),
@@ -696,6 +717,7 @@ function newGroupView() {
     var min = Number(f.min);
     var problem = !f.name.trim() ? "Give your group a name."
       : !f.date ? "Choose the event date."
+      : dateHasPassed(f.date) ? "Choose an event date that is today or later."
       : (!Number.isInteger(min) || min < 1 || min > 50) ? "The minimum must be a whole number from 1 to 50." : "";
     if (problem) { err.textContent = problem; err.hidden = false; return; }
     err.hidden = true; btn.disabled = true; btn.textContent = "Creating…";
@@ -1123,13 +1145,28 @@ function manageView() {
   if (gd.code) linkCard.append(h("p", { class: "muted", style: "font-size:13px", text: "Making a new link switches the old one off. People already in the group stay in." }));
   wrap.append(linkCard);
 
+  // name and event date
+  wrap.append(detailsCard(g));
+
   // members
-  var people = h("div", null);
+  var people = h("div", { id: "member-list" });
+  var frozen = !!g.archived_at;
   gd.members.forEach(function (m) {
-    people.append(h("div", { class: "person" }, avatar(m, "sm"),
+    var row = h("div", { class: "person", "data-member": nameOf(m) }, avatar(m, "sm"),
       h("span", { class: "pn", text: nameOf(m) + (m === myId ? " (you)" : "") }),
       m === myId ? h("span", { class: "chip gold", text: "Admin" }) : null,
-      listFor(m).state === "ready" ? h("span", { class: "chip", text: "List shared" }) : h("span", { class: "chip grey", text: "No list yet" })));
+      listFor(m).state === "ready" ? h("span", { class: "chip", text: "List shared" }) : h("span", { class: "chip grey", text: "No list yet" }));
+    if (m !== myId) {
+      var rm = h("button", { class: "btn sm danger rm-btn", type: "button", text: "Remove", "aria-label": "Remove " + nameOf(m),
+        disabled: frozen ? true : null, title: frozen ? "This group is archived" : null });
+      var conf = h("div", { class: "confirm rm-confirm", hidden: true },
+        h("span", { text: "Remove " + nameOf(m) + "? Their list and everything they picked will be deleted. They can only come back with an invite link." }),
+        h("button", { class: "btn sm primary rm-yes", type: "button", text: "Yes, remove", onclick: function () { removeMember(m, conf); } }),
+        h("button", { class: "btn sm ghost", type: "button", text: "Cancel", onclick: function () { conf.hidden = true; rm.hidden = false; } }));
+      rm.addEventListener("click", function () { conf.hidden = false; rm.hidden = true; });
+      row.append(rm, conf);
+    }
+    people.append(row);
   });
   wrap.append(h("div", { class: "card" }, h("h3", { style: "margin-bottom:6px", text: plural(gd.members.length, "member", "members") }), people));
 
@@ -1148,11 +1185,60 @@ function manageView() {
     arch.addEventListener("click", function () { conf.hidden = false; arch.hidden = true; });
     settings.append(h("div", null, arch), conf);
   } else {
-    settings.append(h("p", { class: "muted", text: "This group is archived. Everything is view-only. Reopening it turns joining, editing and purchases back on." }),
-      h("div", null, h("button", { class: "btn", type: "button", id: "reopen-btn", onclick: function () { setArchived(false); }, text: "Reopen group" })));
+    var datePassed = dateHasPassed(g.event_date);
+    settings.append(h("p", { class: "muted", text: datePassed
+        ? "This group is archived and view-only because its event date passed. To reopen it, choose a new date under Name and date."
+        : "This group is archived. Everything is view-only. Reopening it turns joining, editing and purchases back on." }),
+      h("div", null, h("button", { class: "btn", type: "button", id: "reopen-btn", disabled: datePassed ? true : null, onclick: function () { setArchived(false); }, text: "Reopen group" })));
   }
   wrap.append(settings);
   return wrap;
+}
+function detailsCard(g) {
+  var passed = dateHasPassed(g.event_date);
+  var locked = !!g.archived_at && !passed;     // archived by hand: reopen first. Archived by its date: a new date reopens it.
+  var f = { name: g.name, date: String(g.event_date).slice(0, 10) };
+  var err = h("p", { class: "err", hidden: true, role: "alert", id: "d-err" });
+  var save = h("button", { class: "btn primary", type: "submit", id: "d-save", text: passed && g.archived_at ? "Save and reopen" : "Save changes", disabled: locked ? true : null });
+  var form = h("form", { class: "stack", id: "d-form", novalidate: true },
+    h("div", { class: "field" }, h("label", { for: "d-name", text: "Group name" }),
+      h("input", { id: "d-name", type: "text", maxlength: "60", value: f.name, disabled: locked ? true : null, autocomplete: "off", oninput: function (e) { f.name = e.target.value; } })),
+    h("div", { class: "field" }, h("label", { for: "d-date", text: "Event date" }),
+      h("input", { id: "d-date", type: "date", min: todayStr(), value: f.date, disabled: locked ? true : null, oninput: function (e) { f.date = e.target.value; } })),
+    err, h("div", null, save));
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var problem = !f.name.trim() ? "Give your group a name."
+      : !f.date ? "Choose the event date."
+      : dateHasPassed(f.date) ? "Choose an event date that is today or later." : "";
+    if (problem) { err.textContent = problem; err.hidden = false; return; }
+    err.hidden = true; save.disabled = true;
+    var wasArchived = !!g.archived_at;
+    try {
+      await api(sb.rpc("edit_group", { p_group: route.id, p_name: f.name.trim(), p_event: f.date }));
+      await loadGroups(); await loadGroup();
+      renderMain();
+      toast(wasArchived ? "Group reopened with the new date." : "Group updated.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; save.disabled = false; }
+  });
+  var card = h("div", { class: "card stack", id: "details-card" }, h("h3", { text: "Name and date" }));
+  if (g.archived_at && passed) card.append(h("p", { class: "muted", id: "auto-note", text: "This group archived itself because its event date passed. Choose a new date to reopen it." }));
+  else if (locked) card.append(h("p", { class: "muted", text: "This group is archived. Reopen it below to change its name or date." }));
+  else card.append(h("p", { class: "muted", text: "When the event date passes, the group archives itself and becomes view-only." }));
+  card.append(form);
+  return card;
+}
+async function removeMember(m, conf) {
+  var who = nameOf(m);
+  conf.querySelectorAll("button").forEach(function (b) { b.disabled = true; });
+  try {
+    await api(sb.rpc("remove_member", { p_group: route.id, p_member: m }));
+    await loadGroup(); renderPanel(); updateTabs();
+    toast(who + " was removed from the group.");
+  } catch (e) {
+    toast(humanize(e));
+    conf.querySelectorAll("button").forEach(function (b) { b.disabled = false; });
+  }
 }
 async function setArchived(flag) {
   try {
