@@ -118,7 +118,7 @@ function fmtMoney(cents) {
 function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
 function humanize(err) {
   var m = (err && err.message) || "";
-  if (/at least \d+ items|archived|only the group admin|not valid any more|can.t remove yourself|not in this group|reopen it|has passed|has already passed|person the list is for|event name|wishlist|up to 50 lists|not in this wishlist|add your name|already been fully claimed|group name|item minimum|event date|name up to/i.test(m)) return m.replace(/^ERROR:\s*/, "");
+  if (/at least \d+ items|archived|only the group admin|not valid any more|can.t remove yourself|not in this group|reopen it|has passed|has already passed|person the list is for|event name|wishlist|up to 50 lists|not in this wishlist|not yours to change|up to 20 lists|can only be added|add your name|already been fully claimed|group name|item minimum|event date|name up to/i.test(m)) return m.replace(/^ERROR:\s*/, "");
   if (/jwt|expired|not authenticated/i.test(m)) return "You were signed out. Sign in again to keep going.";
   if (/fetch|network|failed to/i.test(m)) return "Couldn’t reach the server. Check your connection and try again.";
   if (/row-level security|permission denied/i.test(m)) return "That isn’t allowed. The group may have been archived.";
@@ -133,6 +133,10 @@ async function api(promise) {
 /* ---------- data ---------- */
 function groupInfo() { return route.id ? groups.find(function (g) { return g.group_id === route.id; }) : null; }
 function minItems() { var g = groupInfo(); return g ? g.item_min : 3; }
+// Can I edit this person's list? The wishlist admin can on any list in a wishlist; in a normal group, the member who made it can.
+function canManageList(m) {
+  return !!(gd && gd.recipients.has(m) && ((isRegistry() && isAdmin()) || gd.managedBy.get(m) === myId));
+}
 function editingOwner() { return route.view && route.view.indexOf("edit:") === 0 ? route.view.slice(5) : myId; }
 function isArchived() { var g = groupInfo(); return !!(g && g.archived_at); }
 function isAdmin() { var g = groupInfo(); return !!(g && g.is_admin); }
@@ -149,13 +153,14 @@ async function loadGroups() {
 async function loadGroup() {
   var id = route.id;
   var res = await Promise.all([
-    sb.from("group_members").select("member_id,is_recipient").eq("group_id", id),
+    sb.from("group_members").select("member_id,is_recipient,managed_by").eq("group_id", id),
     sb.from("profiles").select("id,name"),
     sb.from("wish_lists").select("owner,submitted_at").eq("group_id", id),
     sb.from("wish_items").select("id,owner,name,description,link,price,price_as_of,quantity,position,created_at").eq("group_id", id).order("position").order("created_at"),
     sb.from("claims").select("item_id,buyer"),
     sb.from("claim_prices").select("item_id,amount"),
-    isAdmin() ? sb.from("group_invites").select("code").eq("group_id", id) : Promise.resolve({ data: [] })
+    isAdmin() ? sb.from("group_invites").select("code").eq("group_id", id) : Promise.resolve({ data: [] }),
+    sb.from("claim_details").select("item_id,note,tracking_url,arrived")
   ]);
   for (var i = 0; i < res.length; i++) if (res[i].error) throw res[i].error;
   var names = new Map((res[1].data || []).map(function (p) { return [p.id, p.name]; }));
@@ -180,12 +185,16 @@ async function loadGroup() {
   claimers.forEach(function (list) { list.sort(function (a, b) { return nameOf2(names, a).localeCompare(nameOf2(names, b)); }); });
   var next = {
     id: id, members: memberIds, names: names, everyone: allIds, recipients: recipients,
+    managedBy: new Map((res[0].data || []).filter(function (m) { return m.managed_by; }).map(function (m) { return [m.member_id, m.managed_by]; })),
+    details: new Map((res[7].data || []).filter(function (r) { return known.has(r.item_id); }).map(function (r) {
+      return [r.item_id, { note: r.note || "", tracking_url: r.tracking_url || "", arrived: !!r.arrived }];
+    })),
     listMeta: new Map((res[2].data || []).map(function (r) { return [r.owner, r]; })),
     items: items, claimers: claimers,
     code: (res[6].data && res[6].data[0] && res[6].data[0].code) || "",
     paid: new Map((res[5].data || []).filter(function (r) { return known.has(r.item_id); }).map(function (r) { return [r.item_id, Number(r.amount)]; }))
   };
-  var s = JSON.stringify([memberIds, allIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code, Array.from(next.paid)]);
+  var s = JSON.stringify([memberIds, allIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code, Array.from(next.paid), Array.from(next.details), Array.from(next.managedBy)]);
   var changed = s !== lastDataSig;
   lastDataSig = s;
   gd = next;
@@ -323,7 +332,7 @@ async function poll() {
       var ch = await loadGroup();
       if (!ch && !gch) return;
       updateTabs();
-      var typing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#d-form, #lists-card");
+      var typing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#d-form, #lists-card, #new-list-form, .buyitem");
       if (route.view !== "my" && route.view.indexOf("edit:") !== 0 && !typing) renderPanel();   // never rebuild the editor while someone is typing
     }
   } catch (e) { /* keep showing what we have; the next poll retries */ }
@@ -388,7 +397,7 @@ function sig(list) { return JSON.stringify(list.map(function (i) { return [i.id,
 function startBlanks() { return Math.min(minItems(), 3); }
 function initEditor(owner) {
   owner = owner || myId;
-  var reg = isRegistry();
+  var reg = owner !== myId;   // a list I manage for someone else: always live, no minimum
   var mine = (gd && gd.items.get(owner)) || [];
   var lm = gd && gd.listMeta.get(owner);
   var submitted = reg || !!(lm && lm.submitted_at);
@@ -511,6 +520,86 @@ function paidInput(item) {
   input.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); input.blur(); } });
   return h("label", { class: "paid", title: "Only you can see what you paid" }, "Paid $", input);
 }
+/* purchase details: a private note, a tracking link, and whether it has arrived */
+function purchaseDetail(item) { return gd.details.get(item.id) || { note: "", tracking_url: "", arrived: false }; }
+function statusOf(item) {
+  var d = purchaseDetail(item);
+  if (d.arrived) return { key: "arrived", label: "In hand", cls: "chip" };
+  if (d.tracking_url) return { key: "shipped", label: "On its way", cls: "chip gold" };
+  return { key: "ordered", label: "Purchased", cls: "chip grey" };
+}
+function storeOf(item) { return item.link ? host(item.link) : ""; }
+async function saveDetail(item, field, value) {
+  var cur = purchaseDetail(item), next = { note: cur.note, tracking_url: cur.tracking_url, arrived: cur.arrived };
+  if (field === "tracking_url" && value) {
+    var nl = normLink(value);
+    if (nl === null) { toast("That tracking link doesn’t look right. Paste the full web address."); return false; }
+    value = nl;
+  }
+  if (field === "note") value = value.trim();
+  next[field] = value;
+  if (JSON.stringify(next) === JSON.stringify(cur)) return true;
+  if (isArchived()) { toast("This group is archived, so nothing can be changed."); return false; }
+  try {
+    var empty = !next.note && !next.tracking_url && !next.arrived;
+    if (empty) {
+      await api(sb.from("claim_details").delete().eq("item_id", item.id).eq("buyer", myId));
+      gd.details.delete(item.id);
+    } else {
+      await api(sb.from("claim_details").upsert({ item_id: item.id, buyer: myId, note: next.note || null, tracking_url: next.tracking_url || null, arrived: next.arrived, updated_at: new Date().toISOString() }));
+      gd.details.set(item.id, next);
+    }
+    return true;
+  } catch (e) { toast(humanize(e)); return false; }
+}
+function buyCard(it) {
+  var frozen = isArchived();
+  var st = h("span", { class: "chip" });
+  var trackLink = h("a", { class: "link", target: "_blank", rel: "noopener noreferrer", "data-track": it.name }, "Track package", icon("ext"));
+  function paint() {
+    var s = statusOf(it), d = purchaseDetail(it);
+    st.className = s.cls; st.textContent = s.label; st.setAttribute("data-status", s.key);
+    trackLink.hidden = !d.tracking_url;
+    if (d.tracking_url) trackLink.href = d.tracking_url;
+    paintSummary();
+  }
+  var note = h("textarea", { rows: "2", maxlength: "300", placeholder: "Add a note (optional), like the order number or where you’ll hide it", class: "bi-note", "data-note": it.name,
+    "aria-label": "Note for " + it.name, disabled: frozen ? true : null });
+  note.value = purchaseDetail(it).note;
+  note.addEventListener("change", async function () {
+    var ok = await saveDetail(it, "note", note.value);
+    if (!ok) note.value = purchaseDetail(it).note; else toast("Note saved. Only you can see it.");
+    paint();
+  });
+  var track = h("input", { type: "url", inputmode: "url", maxlength: "2000", placeholder: "Tracking link (optional)", class: "bi-track", "data-track-input": it.name,
+    "aria-label": "Tracking link for " + it.name, disabled: frozen ? true : null, autocomplete: "off", value: purchaseDetail(it).tracking_url });
+  track.addEventListener("change", async function () {
+    var ok = await saveDetail(it, "tracking_url", track.value.trim());
+    track.value = purchaseDetail(it).tracking_url;
+    if (ok) toast(track.value ? "Tracking link saved." : "Tracking link removed.");
+    paint();
+  });
+  var arrived = h("input", { type: "checkbox", checked: purchaseDetail(it).arrived ? true : null, disabled: frozen ? true : null, "data-arrived": it.name });
+  arrived.addEventListener("change", async function () {
+    var ok = await saveDetail(it, "arrived", arrived.checked);
+    if (!ok) arrived.checked = purchaseDetail(it).arrived; else toast(arrived.checked ? "Marked as in hand." : "Marked as not here yet.");
+    paint();
+  });
+  var store = storeOf(it);
+  var meta = h("div", { class: "bi-meta" },
+    h("span", { class: "bi-store", text: store ? "From " + store : "Store not listed" }),
+    it.link ? h("a", { class: "link", href: it.link, target: "_blank", rel: "noopener noreferrer", "data-item-link": it.name }, "View item", icon("ext")) : null,
+    trackLink);
+  var card = h("li", { class: "buyitem", "data-bought": it.name },
+    h("div", { class: "bi-head" }, h("span", { class: "bi-name", text: it.name }), h("span", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" }, st, paidInput(it))),
+    meta,
+    h("div", { class: "bi-fields" }, note, track),
+    h("label", { class: "chk" }, arrived, "It has arrived and I have it"));
+  card._paint = paint;
+  setTimeout(paint, 0);
+  return card;
+}
+var paintSummary = function () {};
 async function toggleBought(item, btn) {
   if (isArchived()) { toast("This group is archived, so nothing can be changed."); return; }
   if (btn) btn.disabled = true;
@@ -884,7 +973,7 @@ function renderPanel() {
   ui.panel.replaceChildren();
   var v = route.view;
   if (isRegistry() && v === "my") v = route.view = "members";
-  if (v.indexOf("edit:") === 0 && (!isRegistry() || !isAdmin() || !gd.recipients.has(v.slice(5)))) v = route.view = "members";
+  if (v.indexOf("edit:") === 0 && !canManageList(v.slice(5))) v = route.view = "members";
   if (v.indexOf("edit:") === 0 && isArchived()) v = route.view = "member:" + v.slice(5);
   if (v === "my") ui.panel.append(isArchived() ? readOnlyListView() : editorView());
   else if (v.indexOf("edit:") === 0) ui.panel.append(editorView());
@@ -913,7 +1002,9 @@ function registryEditorView(owner) {
   var wrap = h("div", { class: "panel" });
   wrap.append(h("button", { class: "btn ghost back", type: "button", id: "back-lists", onclick: function () { setView("members"); } }, icon("back"), "All lists"));
   wrap.append(h("div", { class: "page-head" }, h("h2", { text: possessive(owner) + " wishlist" }),
-    h("p", { class: "muted", text: "Add as many wishes as you like. Anyone with the invite link sees changes right away and can mark gifts as purchased. As the admin, you can also see who has marked what." })));
+    h("p", { class: "muted", text: isRegistry()
+      ? "Add as many wishes as you like. Anyone with the invite link sees changes right away and can mark gifts as purchased. As the admin, you can also see who has marked what."
+      : "You made this list, so you can edit it. Everyone in the group sees changes right away and can mark gifts as purchased, and you can see who has marked what. Anything you buy from it is marked as bought by you." })));
   ui.items = h("div", { class: "items" });
   wrap.append(ui.items);
   wrap.append(h("button", { class: "btn", type: "button", id: "add-item", onclick: function () {
@@ -928,7 +1019,7 @@ function registryEditorView(owner) {
   return wrap;
 }
 function editorView() {
-  if (isRegistry()) {
+  if (editingOwner() !== myId) {
     var owner = editingOwner();
     if (!editor || editor.owner !== owner) initEditor(owner);
     return registryEditorView(owner);
@@ -1053,6 +1144,7 @@ function membersView() {
       h("p", { class: "muted", text: reg ? (isAdmin() ? "Add a list for someone below." : "The admin hasn’t added any lists yet.")
         : isAdmin() ? "Open the Manage tab to copy the invite link and bring people in." : "Ask the group admin for the invite link to share." })));
     if (reg && isAdmin() && !isArchived()) wrap.append(addListCard());
+    if (!reg && !isArchived()) wrap.append(addListCard());
     return wrap;
   }
   // How many items I have picked from each list, and which shared lists I haven't touched yet.
@@ -1090,19 +1182,28 @@ function membersView() {
       chip = h("span", { class: "chip grey", "data-chip": "waiting", text: reg ? "No items yet" : "No list yet" });
       body = h("p", { class: "meta", text: reg ? "Nothing has been added to this list yet." : nameOf(m) + " hasn’t submitted a list yet." });
     }
-    var canOpen = info.state === "ready" || (reg && isAdmin() && !isArchived());
+    var madeBy = gd.managedBy.get(m);
+    if (madeBy) chip = h("span", { class: "chips" }, chip, h("span", { class: "chip grey", "data-chip": "managed", text: madeBy === myId ? "You manage this list" : "Made by " + nameOf(madeBy) }));
+    var canOpen = info.state === "ready" || (canManageList(m) && !isArchived());
     grid.append(h("button", { class: "tag", type: "button", "data-member": m, disabled: canOpen ? null : true, onclick: function () { setView(info.state === "ready" ? "member:" + m : "edit:" + m); } },
       h("div", { class: "who" }, avatar(m, "md"), h("h3", { text: nameOf(m) })), h("div", { class: "chips" }, chip), body));
   });
   wrap.append(grid);
   if (reg && isAdmin() && !isArchived()) wrap.append(addListCard());
+  if (!reg) {
+    var mineKids = gd.members.filter(function (m) { return gd.managedBy.get(m) === myId; });
+    if (mineKids.length) wrap.append(listsCard(isArchived(), mineKids, "Lists you made for others"));
+    if (!isArchived()) wrap.append(addListCard());
+  }
   return wrap;
 }
 function addListCard() {
+  var reg = isRegistry();
   var input = h("input", { id: "new-list-name", type: "text", maxlength: "40", placeholder: "Who is this list for?", autocomplete: "off", "aria-label": "Name of the person the list is for" });
   var btn = h("button", { class: "btn primary", type: "submit", id: "new-list-go", text: "Add list" });
   var err = h("p", { class: "err", hidden: true, role: "alert", id: "new-list-err" });
-  var form = h("form", { class: "card stack", id: "new-list-form", novalidate: true }, h("h3", { text: "Add another list" }),
+  var form = h("form", { class: "card stack", id: "new-list-form", novalidate: true }, h("h3", { text: reg ? "Add another list" : "Make a list for someone else" }),
+    reg ? null : h("p", { class: "muted", style: "font-size:13px", text: "For a child, or anyone who doesn’t use this site. You can edit their list, and anything you buy from it is marked as bought by you." }),
     h("div", { class: "linkbox" }, input, btn), err);
   form.addEventListener("submit", async function (e) {
     e.preventDefault();
@@ -1111,7 +1212,7 @@ function addListCard() {
     err.hidden = true; btn.disabled = true;
     try {
       var before = new Set(gd.members);
-      await api(sb.rpc("add_list", { p_group: route.id, p_name: name }));
+      await api(sb.rpc(reg ? "add_list" : "add_child_list", { p_group: route.id, p_name: name }));
       await loadGroup();
       var added = gd.members.find(function (m) { return !before.has(m); });
       editor = null;
@@ -1144,7 +1245,7 @@ function claimSide(it) {
 function memberView(member) {
   var info = listFor(member);
   var wrap = h("div", { class: "panel" });
-  var canEdit = isRegistry() && isAdmin() && !isArchived();
+  var canEdit = canManageList(member) && !isArchived();
   wrap.append(h("button", { class: "btn ghost back", type: "button", onclick: function () { setView("members"); } }, icon("back"), "All lists"));
   if (info.state !== "ready") {
     wrap.append(h("div", { class: "card empty" }, h("h3", { text: nameOf(member) + " hasn’t shared a list yet" }),
@@ -1198,6 +1299,27 @@ function purchasesView() {
       h("button", { class: "btn sm", type: "button", onclick: function () { setView("members"); }, text: "Browse lists" })));
     return wrap;
   }
+  // status overview: where everything stands, and which stores the gifts come from
+  var mineAll = [];
+  data.forEach(function (p) { p.bought.forEach(function (it) { mineAll.push(it); }); });
+  var counts = h("dl", { class: "stats3" });
+  var storeLine = h("div", { class: "chips", id: "store-chips" });
+  paintSummary = function () {
+    var c = { ordered: 0, shipped: 0, arrived: 0 }, st = new Map();
+    mineAll.forEach(function (it) { c[statusOf(it).key]++; var k = storeOf(it) || "No link"; st.set(k, (st.get(k) || 0) + 1); });
+    counts.replaceChildren(
+      h("div", null, h("dt", { text: "Purchased" }), h("dd", { id: "cnt-ordered", text: String(c.ordered) })),
+      h("div", null, h("dt", { text: "On its way" }), h("dd", { id: "cnt-shipped", text: String(c.shipped) })),
+      h("div", null, h("dt", { text: "In hand" }), h("dd", { id: "cnt-arrived", text: String(c.arrived) })));
+    storeLine.replaceChildren();
+    Array.from(st.entries()).sort(function (a, b) { return b[1] - a[1] || a[0].localeCompare(b[0]); }).forEach(function (e) {
+      storeLine.append(h("span", { class: "chip grey", "data-store": e[0], text: e[0] + " · " + e[1] }));
+    });
+  };
+  wrap.append(h("div", { class: "card stack", id: "status-summary" }, h("h3", { text: "Where everything stands" }), counts,
+    h("div", null, h("p", { class: "muted", style: "font-size:13px;margin-bottom:6px", text: "Stores" }), storeLine),
+    h("p", { class: "muted", style: "font-size:13px", text: "Notes, tracking links and arrival are private to you." })));
+  paintSummary();
   wrap.append(h("div", { class: "card", id: "grand-total" },
     h("div", { class: "prog-row" }, h("span", { text: "Total spent on all lists" }), h("span", { text: plural(withGifts.length, "list", "lists") })),
     h("div", { class: "total", id: "grand-amount", text: fmtMoney(grand) }),
@@ -1205,9 +1327,7 @@ function purchasesView() {
       ? plural(unpriced, "purchase doesn’t", "purchases don’t") + " have a price yet. Add what you paid below. Only you can see these amounts."
       : "Only you can see these amounts." })));
   withGifts.forEach(function (p) {
-    var rows = p.bought.map(function (it) {
-      return h("li", { class: "buyrow" }, h("span", { class: "bn", text: it.name }), paidInput(it));
-    });
+    var rows = p.bought.map(function (it) { return buyCard(it); });
     wrap.append(h("div", { class: "card", "data-list": p.member },
       h("div", { class: "who-head" }, avatar(p.member, "md"),
         h("div", { style: "flex:1;min-width:0" }, h("h3", { text: nameOf(p.member) }), h("p", { class: "muted", text: p.bought.length + " of " + p.total + " bought" })),
@@ -1276,7 +1396,7 @@ function manageView() {
   var reg = g.kind === "registry";
   var people = h("div", { id: "member-list" });
   var frozen = !!g.archived_at;
-  var peopleIds = reg ? gd.everyone.filter(function (m) { return !gd.recipients.has(m); }) : gd.members;
+  var peopleIds = gd.everyone.filter(function (m) { return !gd.recipients.has(m); });
   if (reg) wrap.append(listsCard(frozen));
   peopleIds.forEach(function (m) {
     var row = h("div", { class: "person", "data-member": nameOf(m) }, avatar(m, "sm"),
@@ -1295,7 +1415,7 @@ function manageView() {
     }
     people.append(row);
   });
-  wrap.append(h("div", { class: "card" }, h("h3", { style: "margin-bottom:6px", text: reg ? plural(peopleIds.length, "person", "people") + " with access" : plural(gd.members.length, "member", "members") }),
+  wrap.append(h("div", { class: "card" }, h("h3", { style: "margin-bottom:6px", text: reg ? plural(peopleIds.length, "person", "people") + " with access" : plural(peopleIds.length, "member", "members") }),
     reg && peopleIds.length <= 1 ? h("p", { class: "muted", text: "Nobody has opened the invite link yet." }) : null, people));
 
   // settings + archive
@@ -1356,9 +1476,10 @@ function detailsCard(g) {
   card.append(form);
   return card;
 }
-function listsCard(frozen) {
-  var card = h("div", { class: "card", id: "lists-card" }, h("h3", { style: "margin-bottom:6px", text: plural(gd.members.length, "list", "lists") }));
-  gd.members.forEach(function (m) {
+function listsCard(frozen, ids, title) {
+  ids = ids || gd.members;
+  var card = h("div", { class: "card", id: "lists-card" }, h("h3", { style: "margin-bottom:6px", text: title || plural(ids.length, "list", "lists") }));
+  ids.forEach(function (m) {
     var n = (gd.items.get(m) || []).length;
     var input = h("input", { type: "text", maxlength: "40", value: nameOf(m), "aria-label": "Name for this list", class: "rename-input", disabled: frozen ? true : null });
     var save = h("button", { class: "btn sm", type: "button", text: "Rename", disabled: true });
@@ -1379,14 +1500,14 @@ function listsCard(frozen) {
     del.addEventListener("click", function () { conf.hidden = false; del.hidden = true; });
     card.append(h("div", { class: "person", "data-list": nameOf(m) }, input, save, h("span", { class: "chip grey", text: plural(n, "wish", "wishes") }), edit, del, conf));
   });
-  if (!gd.members.length) card.append(h("p", { class: "muted", text: "No lists yet. Add one from the Lists tab." }));
+  if (!ids.length) card.append(h("p", { class: "muted", text: "No lists yet. Add one from the Lists tab." }));
   return card;
 }
 async function removeMember(m, conf, what) {
   var who = nameOf(m);
   conf.querySelectorAll("button").forEach(function (b) { b.disabled = true; });
   try {
-    await api(sb.rpc("remove_member", { p_group: route.id, p_member: m }));
+    await api(what === "list" ? sb.rpc("delete_child_list", { p_group: route.id, p_member: m }) : sb.rpc("remove_member", { p_group: route.id, p_member: m }));
     await loadGroup(); renderPanel(); updateTabs();
     toast(what === "list" ? who + "’s list was deleted." : who + " was removed from the group.");
   } catch (e) {

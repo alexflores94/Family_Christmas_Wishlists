@@ -189,6 +189,25 @@ p{margin:0}
 .buyrow:first-child{border-top:0}
 .buyrow .bn{min-width:0;overflow-wrap:anywhere;font-weight:500}
 .buyrow .bp{white-space:nowrap;font-variant-numeric:tabular-nums;text-align:right}
+.buyitem{padding:14px 0;border-top:1px solid var(--line);display:flex;flex-direction:column;gap:9px}
+.buyitem:first-child{border-top:0}
+.bi-head{display:flex;gap:8px 12px;align-items:flex-start;justify-content:space-between;flex-wrap:wrap}
+.bi-name{font-weight:600;overflow-wrap:anywhere;min-width:0}
+.bi-meta{font-size:13px;color:var(--muted);display:flex;gap:6px 14px;flex-wrap:wrap;align-items:center}
+.bi-fields{display:grid;grid-template-columns:1fr 1fr;gap:8px}
+@media(max-width:560px){.bi-fields{grid-template-columns:1fr}}
+.bi-fields textarea,.bi-fields input{width:100%;min-width:0;background:var(--surface-2);border:1px solid var(--line);border-radius:8px;padding:8px 10px;font:inherit;font-size:14px}
+.bi-fields textarea{resize:vertical;min-height:40px}
+.bi-fields textarea:focus,.bi-fields input:focus{outline:2px solid var(--primary);outline-offset:0;background:var(--surface)}
+.bi-fields :disabled{opacity:.55;cursor:not-allowed}
+.buyitem .chk{display:inline-flex;align-items:center;gap:8px;font-size:14px;cursor:pointer;align-self:flex-start}
+.buyitem .chk input{width:auto;accent-color:var(--primary)}
+.bi-meta .link{color:var(--primary);font-weight:600;text-decoration:none;display:inline-flex;align-items:center;gap:4px}
+.bi-meta .link:hover{text-decoration:underline}
+.stats3{display:grid;grid-template-columns:repeat(3,1fr);gap:10px;margin:0}
+.stats3 div{display:flex;flex-direction:column;gap:1px}
+.stats3 dt{font-size:12px;color:var(--muted)}
+.stats3 dd{margin:0;font-family:var(--f-display);font-size:26px;color:var(--primary);font-variant-numeric:tabular-nums}
 .back{align-self:flex-start}
 @media (max-width:520px){.tab{padding:9px 6px;font-size:14px;gap:5px}.tab .badge{padding:1px 6px}}
 .empty{display:flex;flex-direction:column;gap:6px;align-items:flex-start}

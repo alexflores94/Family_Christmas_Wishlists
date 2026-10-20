@@ -92,6 +92,9 @@ create table if not exists public.group_members (
 -- In a registry, the people the lists are FOR are stored as members flagged is_recipient. They are placeholders
 -- (a name, no real email) and can never sign in.
 alter table public.group_members add column if not exists is_recipient boolean not null default false;
+-- In a normal group, a member can also make lists for other people (their kids, say). Those are placeholder
+-- members flagged is_recipient, and managed_by is the member who made and edits the list.
+alter table public.group_members add column if not exists managed_by uuid references public.profiles(id);
 
 create table if not exists public.wish_lists (
   group_id     uuid not null,
@@ -136,6 +139,19 @@ create table if not exists public.claim_prices (
   buyer      uuid not null,
   amount     numeric(10, 2) not null check (amount >= 0 and amount < 10000000),
   updated_at timestamptz not null default now(),
+  primary key (item_id, buyer),
+  foreign key (item_id, buyer) references public.claims(item_id, buyer) on delete cascade
+);
+
+-- A shopper's own notes about something they picked: a note, a tracking link, and whether it has arrived.
+-- Private to that shopper, like the price.
+create table if not exists public.claim_details (
+  item_id      uuid not null,
+  buyer        uuid not null,
+  note         text check (note is null or length(note) <= 300),
+  tracking_url text check (tracking_url is null or (tracking_url ~* '^https?://' and length(tracking_url) <= 2000)),
+  arrived      boolean not null default false,
+  updated_at   timestamptz not null default now(),
   primary key (item_id, buyer),
   foreign key (item_id, buyer) references public.claims(item_id, buyer) on delete cascade
 );
@@ -265,7 +281,8 @@ create trigger wish_items_touch before update on public.wish_items
   for each row execute function public.touch_item();
 
 -- Who may add, change or remove the items on a list:
---   a normal group: only the list's owner;  a registry: only the admin, and only on a recipient's list.
+--   a normal group: the list's owner, or the member who made a list for someone else;
+--   a registry: only the admin, and only on a recipient's list.
 create or replace function public.can_edit_items(p_group uuid, p_owner uuid)
 returns boolean
 language sql stable security definer
@@ -274,7 +291,10 @@ as $$
   select public.group_open(p_group) and exists (
     select 1 from public.groups g
     where g.id = p_group and (
-      (g.kind = 'group' and p_owner = public.my_id() and public.is_member(p_group))
+      (g.kind = 'group' and public.is_member(p_group) and (
+          p_owner = public.my_id()
+          or exists (select 1 from public.group_members m
+                     where m.group_id = p_group and m.member_id = p_owner and m.is_recipient and m.managed_by = public.my_id())))
       or (g.kind = 'registry' and g.admin_id = public.my_id()
           and exists (select 1 from public.group_members m where m.group_id = p_group and m.member_id = p_owner and m.is_recipient))
     ))
@@ -291,6 +311,7 @@ begin
   select item_min into v_min from public.groups where id = old.group_id and kind = 'group';
   if v_min is not null
      and public.list_submitted(old.group_id, old.owner)
+     and not exists (select 1 from public.group_members m where m.group_id = old.group_id and m.member_id = old.owner and m.is_recipient)
      and (select count(*) from public.wish_items where group_id = old.group_id and owner = old.owner) <= v_min then
     raise exception 'A submitted list needs at least % items. Add another item first, then remove this one.', v_min;
   end if;
@@ -473,10 +494,10 @@ as $$
   select g.id, g.name, g.event_date, g.created_at, g.archived_at,
          g.admin_id = public.my_id(), g.item_min,
          -- in a registry "members" counts the lists (the people the wishes are for)
-         (select count(*)::int from public.group_members x where x.group_id = g.id and (g.kind = 'group' or x.is_recipient)),
+         (select count(*)::int from public.group_members x where x.group_id = g.id and ((g.kind = 'group') <> x.is_recipient)),
          (select count(*)::int from public.group_members x
            where x.group_id = g.id and x.member_id <> public.my_id() and (g.kind = 'group' or x.is_recipient)
-             and (g.kind = 'group' or exists (select 1 from public.wish_items w where w.group_id = g.id and w.owner = x.member_id))
+             and (not x.is_recipient or exists (select 1 from public.wish_items w where w.group_id = g.id and w.owner = x.member_id))
              and not exists (select 1 from public.claims c join public.wish_items i on i.id = c.item_id
                              where i.group_id = g.id and i.owner = x.member_id and c.buyer = public.my_id())),
          (g.kind = 'registry' or public.list_submitted(g.id, public.my_id())),
@@ -495,7 +516,7 @@ language sql stable security definer
 set search_path = public, pg_temp
 as $$
   select g.name, g.event_date, (g.archived_at is not null or g.event_date < public.today_local()),
-         (select count(*)::int from public.group_members x where x.group_id = g.id and (g.kind = 'group' or x.is_recipient)),
+         (select count(*)::int from public.group_members x where x.group_id = g.id and ((g.kind = 'group') <> x.is_recipient)),
          g.kind
   from public.group_invites i join public.groups g on g.id = i.group_id
   where i.code = p_code
@@ -594,11 +615,26 @@ $$;
 
 -- Admin only. Takes someone out of the group and deletes their list and everything they picked.
 -- They can rejoin only with a valid invite link (make a new link to lock the old one).
+-- Internal: deletes a placeholder list, its items, and everything picked on it. Not callable from the website.
+create or replace function public.drop_list(p_group uuid, p_member uuid)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+begin
+  delete from public.wish_lists where group_id = p_group and owner = p_member;
+  delete from public.wish_items where group_id = p_group and owner = p_member;
+  delete from public.group_members where group_id = p_group and member_id = p_member and is_recipient;
+  delete from public.profiles where id = p_member and email like '%@lists.invalid';
+end
+$$;
+
 create or replace function public.remove_member(p_group uuid, p_member uuid)
 returns void
 language plpgsql security definer
 set search_path = public, pg_temp
 as $$
+declare r record;
 begin
   if not public.is_admin(p_group) then raise exception 'Only the group admin can do that'; end if;
   if not public.group_open(p_group) then raise exception 'This group is archived, so members can no longer be removed'; end if;
@@ -606,6 +642,10 @@ begin
   if not exists (select 1 from public.group_members where group_id = p_group and member_id = p_member) then
     raise exception 'That person is not in this group';
   end if;
+  -- Lists they made for other people go with them.
+  for r in select member_id from public.group_members where group_id = p_group and managed_by = p_member loop
+    perform public.drop_list(p_group, r.member_id);
+  end loop;
   -- Un-submit first so the minimum-items rule lets their items go.
   delete from public.wish_lists where group_id = p_group and owner = p_member;
   delete from public.wish_items where group_id = p_group and owner = p_member;
@@ -665,19 +705,61 @@ begin
 end
 $$;
 
--- Admin only. Renames the person a list is for.
+-- Renames the person a list is for. The wishlist admin can rename any list in a wishlist; in a normal group,
+-- the member who made a list for someone can rename it.
 create or replace function public.rename_list(p_group uuid, p_member uuid, p_name text)
 returns void
 language plpgsql security definer
 set search_path = public, pg_temp
 as $$
 begin
-  if not public.is_admin(p_group) then raise exception 'Only the group admin can do that'; end if;
   if not public.group_open(p_group) then raise exception 'This group is archived, so lists can no longer be changed'; end if;
   if length(trim(coalesce(p_name, ''))) not between 1 and 40 then raise exception 'Enter the name of the person the list is for, up to 40 characters'; end if;
   update public.profiles set name = trim(p_name)
-   where id = p_member and exists (select 1 from public.group_members where group_id = p_group and member_id = p_member and is_recipient);
-  if not found then raise exception 'That list is not in this wishlist'; end if;
+   where id = p_member and exists (
+     select 1 from public.group_members m join public.groups g on g.id = m.group_id
+     where m.group_id = p_group and m.member_id = p_member and m.is_recipient
+       and (m.managed_by = public.my_id() or (g.kind = 'registry' and g.admin_id = public.my_id())));
+  if not found then raise exception 'That list is not yours to change'; end if;
+end
+$$;
+
+-- Any member of a normal group can make a list for someone else (a child, say). They can view and edit it,
+-- and anything they buy from it is marked as bought by them.
+create or replace function public.add_child_list(p_group uuid, p_name text)
+returns uuid
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare r uuid; m uuid := public.my_id();
+begin
+  if m is null or not public.is_member(p_group) then raise exception 'You are not in this group'; end if;
+  if not exists (select 1 from public.groups where id = p_group and kind = 'group') then raise exception 'Lists for other people can only be added in a group'; end if;
+  if not public.group_open(p_group) then raise exception 'This group is archived, so lists can no longer be added'; end if;
+  if length(trim(coalesce(p_name, ''))) not between 1 and 40 then raise exception 'Enter the name of the person the list is for, up to 40 characters'; end if;
+  if (select count(*) from public.group_members where group_id = p_group and managed_by = m) >= 20 then raise exception 'You can make up to 20 lists for other people in one group'; end if;
+  insert into public.profiles (email, name)
+  values ('list-' || gen_random_uuid()::text || '@lists.invalid', trim(p_name)) returning id into r;
+  insert into public.group_members (group_id, member_id, is_recipient, managed_by) values (p_group, r, true, m);
+  insert into public.wish_lists (group_id, owner, submitted_at) values (p_group, r, now());
+  return r;
+end
+$$;
+
+-- Deletes a list made for someone else, with everything on it. Only the member who made it (or the group admin).
+create or replace function public.delete_child_list(p_group uuid, p_member uuid)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.group_open(p_group) then raise exception 'This group is archived, so lists can no longer be deleted'; end if;
+  if not exists (select 1 from public.group_members m
+                 where m.group_id = p_group and m.member_id = p_member and m.is_recipient
+                   and (m.managed_by = public.my_id() or public.is_admin(p_group))) then
+    raise exception 'That list is not yours to change';
+  end if;
+  perform public.drop_list(p_group, p_member);
 end
 $$;
 
@@ -821,6 +903,25 @@ create policy prices_delete on public.claim_prices
   for delete to authenticated
   using (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
 
+-- Notes, tracking links and arrival: same rules as prices.
+alter table public.claim_details enable row level security;
+drop policy if exists details_read on public.claim_details;
+create policy details_read on public.claim_details
+  for select to authenticated using (buyer = public.my_id());
+drop policy if exists details_insert on public.claim_details;
+create policy details_insert on public.claim_details
+  for insert to authenticated
+  with check (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
+drop policy if exists details_update on public.claim_details;
+create policy details_update on public.claim_details
+  for update to authenticated
+  using (buyer = public.my_id() and public.group_open(public.item_group(item_id)))
+  with check (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
+drop policy if exists details_delete on public.claim_details;
+create policy details_delete on public.claim_details
+  for delete to authenticated
+  using (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
+
 -- ---------------------------------------------------------------------------
 -- Upgrade from the single-family version (runs once, only if the old tables exist)
 -- ---------------------------------------------------------------------------
@@ -909,6 +1010,7 @@ grant select (id, name) on public.profiles to authenticated;
 grant select, insert, update, delete on public.wish_items to authenticated;
 grant select, insert, delete on public.claims to authenticated;
 grant select, insert, update, delete on public.claim_prices to authenticated;
+grant select, insert, update, delete on public.claim_details to authenticated;
 
 revoke all on all functions in schema public from public, anon, authenticated;
 grant execute on function
@@ -917,7 +1019,8 @@ grant execute on function
   public.set_profile(text), public.create_group(text, date, int), public.my_groups(),
   public.join_group(text), public.generate_invite(uuid), public.set_group_archived(uuid, boolean), public.submit_list(uuid),
   public.today_local(), public.sweep_archives(), public.edit_group(uuid, text, date), public.remove_member(uuid, uuid),
-  public.can_edit_items(uuid, uuid), public.create_registry(text, date, text), public.add_list(uuid, text), public.rename_list(uuid, uuid, text)
+  public.can_edit_items(uuid, uuid), public.create_registry(text, date, text), public.add_list(uuid, text), public.rename_list(uuid, uuid, text),
+  public.add_child_list(uuid, text), public.delete_child_list(uuid, uuid)
   to authenticated;
 grant execute on function public.preview_invite(text) to anon, authenticated;
 
