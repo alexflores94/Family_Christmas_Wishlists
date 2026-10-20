@@ -118,7 +118,7 @@ function fmtMoney(cents) {
 function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
 function humanize(err) {
   var m = (err && err.message) || "";
-  if (/at least \d+ items|archived|only the group admin|not valid any more|can.t remove yourself|not in this group|reopen it|has passed|has already passed|add your name|already been fully claimed|group name|item minimum|event date|name up to/i.test(m)) return m.replace(/^ERROR:\s*/, "");
+  if (/at least \d+ items|archived|only the group admin|not valid any more|can.t remove yourself|not in this group|reopen it|has passed|has already passed|person the list is for|event name|wishlist|up to 50 lists|not in this wishlist|add your name|already been fully claimed|group name|item minimum|event date|name up to/i.test(m)) return m.replace(/^ERROR:\s*/, "");
   if (/jwt|expired|not authenticated/i.test(m)) return "You were signed out. Sign in again to keep going.";
   if (/fetch|network|failed to/i.test(m)) return "Couldn’t reach the server. Check your connection and try again.";
   if (/row-level security|permission denied/i.test(m)) return "That isn’t allowed. The group may have been archived.";
@@ -133,8 +133,10 @@ async function api(promise) {
 /* ---------- data ---------- */
 function groupInfo() { return route.id ? groups.find(function (g) { return g.group_id === route.id; }) : null; }
 function minItems() { var g = groupInfo(); return g ? g.item_min : 3; }
+function editingOwner() { return route.view && route.view.indexOf("edit:") === 0 ? route.view.slice(5) : myId; }
 function isArchived() { var g = groupInfo(); return !!(g && g.archived_at); }
 function isAdmin() { var g = groupInfo(); return !!(g && g.is_admin); }
+function isRegistry() { var g = groupInfo(); return !!(g && g.kind === "registry"); }   // a one-way wishlist
 
 async function loadGroups() {
   // Groups whose event date has passed archive themselves; do it before reading so every screen agrees.
@@ -147,7 +149,7 @@ async function loadGroups() {
 async function loadGroup() {
   var id = route.id;
   var res = await Promise.all([
-    sb.from("group_members").select("member_id").eq("group_id", id),
+    sb.from("group_members").select("member_id,is_recipient").eq("group_id", id),
     sb.from("profiles").select("id,name"),
     sb.from("wish_lists").select("owner,submitted_at").eq("group_id", id),
     sb.from("wish_items").select("id,owner,name,description,link,price,price_as_of,quantity,position,created_at").eq("group_id", id).order("position").order("created_at"),
@@ -157,8 +159,12 @@ async function loadGroup() {
   ]);
   for (var i = 0; i < res.length; i++) if (res[i].error) throw res[i].error;
   var names = new Map((res[1].data || []).map(function (p) { return [p.id, p.name]; }));
-  var memberIds = (res[0].data || []).map(function (m) { return m.member_id; });
-  memberIds.sort(function (a, b) { return (names.get(a) || a).localeCompare(names.get(b) || b); });
+  var byName = function (a, b) { return (names.get(a) || a).localeCompare(names.get(b) || b); };
+  var allIds = (res[0].data || []).map(function (m) { return m.member_id; }).sort(byName);
+  var recipients = new Set((res[0].data || []).filter(function (m) { return m.is_recipient; }).map(function (m) { return m.member_id; }));
+  // In a one-way wishlist the "members" the screens loop over are the lists (the people wishes are for);
+  // everyone else is a viewer.
+  var memberIds = isRegistry() ? allIds.filter(function (m) { return recipients.has(m); }) : allIds;
   var items = new Map();
   (res[3].data || []).forEach(function (it) {
     if (!items.has(it.owner)) items.set(it.owner, []);
@@ -173,13 +179,13 @@ async function loadGroup() {
   });
   claimers.forEach(function (list) { list.sort(function (a, b) { return nameOf2(names, a).localeCompare(nameOf2(names, b)); }); });
   var next = {
-    id: id, members: memberIds, names: names,
+    id: id, members: memberIds, names: names, everyone: allIds, recipients: recipients,
     listMeta: new Map((res[2].data || []).map(function (r) { return [r.owner, r]; })),
     items: items, claimers: claimers,
     code: (res[6].data && res[6].data[0] && res[6].data[0].code) || "",
     paid: new Map((res[5].data || []).filter(function (r) { return known.has(r.item_id); }).map(function (r) { return [r.item_id, Number(r.amount)]; }))
   };
-  var s = JSON.stringify([memberIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code, Array.from(next.paid)]);
+  var s = JSON.stringify([memberIds, allIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code, Array.from(next.paid)]);
   var changed = s !== lastDataSig;
   lastDataSig = s;
   gd = next;
@@ -189,7 +195,7 @@ function nameOf2(names, id) { return names.get(id) || ""; }
 
 function listFor(email) {
   var lm = gd.listMeta.get(email), items = gd.items.get(email) || [];
-  if (lm && lm.submitted_at && items.length) return { state: "ready", items: items };
+  if ((isRegistry() || (lm && lm.submitted_at)) && items.length) return { state: "ready", items: items };
   return { state: "pending", items: [] };
 }
 function claimersOf(item) { return gd.claimers.get(item.id) || []; }
@@ -317,8 +323,8 @@ async function poll() {
       var ch = await loadGroup();
       if (!ch && !gch) return;
       updateTabs();
-      var typing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#d-form");
-      if (route.view !== "my" && !typing) renderPanel();   // never rebuild the editor while someone is typing
+      var typing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#d-form, #lists-card");
+      if (route.view !== "my" && route.view.indexOf("edit:") !== 0 && !typing) renderPanel();   // never rebuild the editor while someone is typing
     }
   } catch (e) { /* keep showing what we have; the next poll retries */ }
 }
@@ -351,6 +357,7 @@ async function openGroup(id, view) {
   try {
     await loadGroups();
     if (!groupInfo()) { route = { name: "dashboard" }; renderMain(); toast("That group isn’t available."); return; }
+    if (!view && isRegistry()) route.view = "members";
     await loadGroup();
   } catch (e) { toast(humanize(e)); route = { name: "dashboard" }; renderMain(); return; }
   ui.loadingGroup = false;
@@ -379,17 +386,19 @@ function cleanItems() {
 }
 function sig(list) { return JSON.stringify(list.map(function (i) { return [i.id, i.name, i.description, i.link || "", i.quantity]; })); }
 function startBlanks() { return Math.min(minItems(), 3); }
-function initEditor() {
-  var mine = (gd && gd.items.get(myId)) || [];
-  var lm = gd && gd.listMeta.get(myId);
-  var submitted = !!(lm && lm.submitted_at);
+function initEditor(owner) {
+  owner = owner || myId;
+  var reg = isRegistry();
+  var mine = (gd && gd.items.get(owner)) || [];
+  var lm = gd && gd.listMeta.get(owner);
+  var submitted = reg || !!(lm && lm.submitted_at);
   var items = mine.map(function (i) {
     return { id: i.id, key: i.id, name: i.name, description: i.description, link: i.link || "",
       qty: i.quantity === null ? "1" : String(i.quantity), unlimited: i.quantity === null };
   });
   while (!submitted && items.length < startBlanks()) items.push(blank());
   if (items.length === 0) items.push(blank());
-  editor = { items: items, submitted: submitted, saving: false, showErrors: false, baseSig: "" };
+  editor = { owner: owner, registry: reg, items: items, submitted: submitted, saving: false, showErrors: false, baseSig: "" };
   editor.baseSig = sig(cleanItems().complete);
 }
 function editorDirty() {
@@ -402,7 +411,7 @@ window.addEventListener("beforeunload", function (e) {
 });
 
 async function persistItems(complete) {
-  var server = (gd.items.get(myId)) || [];
+  var server = (gd.items.get(editor.owner)) || [];
   var keep = new Set(complete.filter(function (c) { return c.id; }).map(function (c) { return c.id; }));
   var r, i;
   for (i = 0; i < complete.length; i++) {
@@ -415,7 +424,7 @@ async function persistItems(complete) {
   complete.forEach(function (c, idx) { if (!c.id) fresh.push({ idx: idx, c: c }); });
   if (fresh.length) {
     r = await sb.from("wish_items").insert(fresh.map(function (f) {
-      return { group_id: route.id, owner: myId, name: f.c.name, description: f.c.description, link: f.c.link || null, quantity: f.c.quantity, position: f.idx };
+      return { group_id: route.id, owner: editor.owner, name: f.c.name, description: f.c.description, link: f.c.link || null, quantity: f.c.quantity, position: f.idx };
     })).select("id,position");
     if (r.error) throw r.error;
     (r.data || []).forEach(function (row) {
@@ -434,8 +443,8 @@ async function persistItems(complete) {
 async function afterSave() {
   await loadGroup();
   editor.items = editor.items.filter(function (it) { return !isBlankRow(it); });
-  var lm = gd.listMeta.get(myId);
-  editor.submitted = !!(lm && lm.submitted_at);
+  var lm = gd.listMeta.get(editor.owner);
+  editor.submitted = editor.registry || !!(lm && lm.submitted_at);
   while (!editor.submitted && editor.items.length < startBlanks()) editor.items.push(blank());
   if (editor.items.length === 0) editor.items.push(blank());
   editor.baseSig = sig(cleanItems().complete);
@@ -456,7 +465,7 @@ async function saveDraft() {
 async function submitList() {
   var r = cleanItems();
   editor.showErrors = true;
-  if (r.problems > 0 || r.complete.length < minItems()) { rebuildItems(); updateBar(); return; }
+  if (r.problems > 0 || (!editor.registry && r.complete.length < minItems())) { rebuildItems(); updateBar(); return; }
   var first = !editor.submitted;
   editor.saving = true; updateBar();
   try {
@@ -646,6 +655,7 @@ function renderMain() {
   var root = h("div", { class: "panel" }, topBar("Gifts, together", null));
   root.append(ui.confirmRow);
   if (route.name === "new") root.append(newGroupView());
+  else if (route.name === "new-wishlist") root.append(newWishlistView());
   else if (route.name === "join") root.append(joinView());
   else root.append(dashboardView());
   app.append(root);
@@ -659,8 +669,10 @@ function dashboardView() {
   var wrap = h("div", { class: "panel" });
   wrap.append(h("div", { class: "dash-head" },
     h("div", { class: "page-head" }, h("h2", { text: "Your wish groups" }),
-      h("p", { class: "muted", text: dashTab === "archived" ? "Archived groups are view-only. Nothing in them can be changed." : groups.length ? "Open a group to add your wishes or shop for the people in it." : "Make a group for family, friends or a gift swap." })),
-    h("button", { class: "btn primary", type: "button", id: "new-group", onclick: function () { route = { name: "new" }; renderMain(); window.scrollTo({ top: 0 }); } }, icon("plus"), "New group")));
+      h("p", { class: "muted", text: dashTab === "archived" ? "Archived groups and wishlists are view-only. Nothing in them can be changed." : groups.length ? "Open a group to add your wishes or shop for the people in it." : "Make a group for family, friends or a gift swap, or a wishlist to share with family." })),
+    h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" },
+      h("button", { class: "btn", type: "button", id: "new-wishlist", onclick: function () { route = { name: "new-wishlist" }; renderMain(); window.scrollTo({ top: 0 }); } }, icon("plus"), "New wishlist"),
+      h("button", { class: "btn primary", type: "button", id: "new-group", onclick: function () { route = { name: "new" }; renderMain(); window.scrollTo({ top: 0 }); } }, icon("plus"), "New group"))));
   function tab(id, key, text, n) {
     return h("button", { class: "tab", type: "button", role: "tab", id: id, "aria-selected": dashTab === key ? "true" : "false",
       onclick: function () { dashTab = key; renderMain(); } }, text, h("span", { class: "badge", text: String(n) }));
@@ -678,11 +690,13 @@ function dashboardView() {
   var grid = h("div", { class: "grid" });
   showing.forEach(function (g) {
     var d = daysUntil(g.event_date);
-    var left = g.member_count <= 1 ? "Just you so far" : g.left_to_shop === 0 ? "All shopped for" : g.left_to_shop + " to go";
+    var left = g.kind !== "registry" && g.member_count <= 1 ? "Just you so far" : g.left_to_shop === 0 ? "All shopped for" : g.left_to_shop + " to go";
     var chips = h("div", { class: "chips" });
+    var isReg = g.kind === "registry";
+    if (isReg) chips.append(h("span", { class: "chip", "data-chip": "wishlist", text: "Wishlist" }));
     if (g.is_admin) chips.append(h("span", { class: "chip gold", text: "Admin" }));
     if (g.archived_at) chips.append(h("span", { class: "chip grey", text: "Archived" }));
-    else if (!g.list_submitted) chips.append(h("span", { class: "chip red", text: "Your list isn’t shared" }));
+    else if (!isReg && !g.list_submitted) chips.append(h("span", { class: "chip red", text: "Your list isn’t shared" }));
     grid.append(h("button", { class: "tag gcard" + (g.archived_at ? " archived" : ""), type: "button", "data-gid": g.group_id, "aria-label": "Open " + g.name, onclick: function () { openGroup(g.group_id); } },
       h("div", null, h("h3", { text: g.name })),
       chips,
@@ -690,11 +704,48 @@ function dashboardView() {
         h("div", null, h("dt", { text: "Event date" }), h("dd", { class: "s-event" }, fmtDay(g.event_date), g.archived_at ? null : h("span", { class: "muted", style: "display:block;font-weight:400;font-size:13px", text: d > 1 ? "in " + d + " days" : d === 1 ? "tomorrow" : d === 0 ? "today" : "passed" }))),
         h("div", null, h("dt", { text: "Created by" }), h("dd", { class: "s-creator", text: g.admin_name || "—" })),
         h("div", null, h("dt", { text: "Created" }), h("dd", { class: "s-created", text: fmtDay(g.created_at) })),
-        h("div", null, h("dt", { text: "Members" }), h("dd", { class: "s-members", text: String(g.member_count) })),
+        h("div", null, h("dt", { text: isReg ? "Lists" : "Members" }), h("dd", { class: "s-members", text: String(g.member_count) })),
         h("div", null, h("dt", { text: "Left to shop for" }), h("dd", { class: "s-left", text: left })))));
   });
   wrap.append(grid);
   return wrap;
+}
+
+/* create a one-way wishlist */
+function newWishlistView() {
+  var f = { name: "", date: "", who: "" };
+  var err = h("p", { class: "err", hidden: true, role: "alert", id: "w-err" });
+  var btn = h("button", { class: "btn primary", type: "submit", id: "w-create", text: "Create wishlist" });
+  var form = h("form", { class: "card item", id: "w-form", novalidate: true },
+    h("div", { class: "page-head" }, h("h2", { text: "New wishlist" }),
+      h("p", { class: "muted", text: "A one-way list for an event, like a birthday or a Christmas list you write for your kids. People you share the link with can see it and mark gifts as purchased, but they can’t make lists of their own." })),
+    h("div", { class: "field" }, h("label", { for: "w-name", text: "Event name" }),
+      h("input", { id: "w-name", type: "text", maxlength: "60", placeholder: "Christmas 2026, Mia’s 5th birthday…", autocomplete: "off", oninput: function (e) { f.name = e.target.value; } })),
+    h("div", { class: "field" }, h("label", { for: "w-date", text: "Event date" }),
+      h("input", { id: "w-date", type: "date", min: todayStr(), oninput: function (e) { f.date = e.target.value; } })),
+    h("div", { class: "field" }, h("label", { for: "w-who", text: "Who is the list for?" }),
+      h("input", { id: "w-who", type: "text", maxlength: "40", placeholder: "Name", autocomplete: "off", oninput: function (e) { f.who = e.target.value; } }),
+      h("p", { class: "muted", style: "font-size:13px", text: "You can add more lists for other people after this." })),
+    err,
+    h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, btn,
+      h("button", { class: "btn ghost", type: "button", id: "w-cancel", onclick: function () { route = { name: "dashboard" }; renderMain(); }, text: "Cancel" })));
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var problem = !f.name.trim() ? "Give the event a name."
+      : !f.date ? "Choose the event date."
+      : dateHasPassed(f.date) ? "Choose an event date that is today or later."
+      : !f.who.trim() ? "Enter the name of the person the list is for." : "";
+    if (problem) { err.textContent = problem; err.hidden = false; return; }
+    err.hidden = true; btn.disabled = true; btn.textContent = "Creating…";
+    try {
+      var id = await api(sb.rpc("create_registry", { p_name: f.name.trim(), p_event: f.date, p_for: f.who.trim() }));
+      await openGroup(id, "members");
+      var first = gd && gd.members[0];
+      if (first) setView("edit:" + first);
+      toast("Wishlist created. Add their wishes, then share the invite link from the Manage tab.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = "Create wishlist"; }
+  });
+  return h("div", { class: "panel" }, form);
 }
 
 /* create a group */
@@ -750,7 +801,8 @@ function joinView() {
   }
   var already = groups.find(function (g) { return g.name === joinInfo.group_name && g.event_date === joinInfo.event_date; });
   var err = h("p", { class: "err", hidden: true, role: "alert", id: "join-err" });
-  var btn = h("button", { class: "btn primary", type: "button", id: "join-go", text: "Join group", disabled: joinInfo.archived && !already ? true : null });
+  var wl = joinInfo.kind === "registry";
+  var btn = h("button", { class: "btn primary", type: "button", id: "join-go", text: wl ? "Open wishlist" : "Join group", disabled: joinInfo.archived && !already ? true : null });
   btn.addEventListener("click", async function () {
     btn.disabled = true; btn.textContent = "Joining…";
     try {
@@ -758,14 +810,14 @@ function joinView() {
       finishJoinLink();
       await loadGroups();
       await openGroup(id);
-      toast("You’re in! Add your wishes whenever you’re ready.");
-    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = "Join group"; }
+      toast(wl ? "You’re in! Open a list and mark gifts as purchased." : "You’re in! Add your wishes whenever you’re ready.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = wl ? "Open wishlist" : "Join group"; }
   });
-  wrap.append(heroView("Join " + joinInfo.group_name + "?", "You’re signed in as " + myEmail + ". You’ll sign in with this email whenever you come back.", "You’re invited"),
+  wrap.append(heroView((wl ? "Open " : "Join ") + joinInfo.group_name + "?", "You’re signed in as " + myEmail + ". You’ll sign in with this email whenever you come back." + (wl ? " You’ll be able to see the lists and mark gifts as purchased." : ""), "You’re invited"),
     h("div", { class: "card" },
       h("dl", { class: "stats" },
         h("div", null, h("dt", { text: "Event date" }), h("dd", { text: fmtDay(joinInfo.event_date) })),
-        h("div", null, h("dt", { text: "Members so far" }), h("dd", { text: String(joinInfo.member_count) })))),
+        h("div", null, h("dt", { text: wl ? "Lists" : "Members so far" }), h("dd", { text: String(joinInfo.member_count) })))),
     joinInfo.archived && !already ? h("div", { class: "note warn" }, icon("lock"), h("span", { text: "This group is archived and closed to new members." })) : "",
     err,
     h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, btn,
@@ -778,10 +830,11 @@ function groupShell() {
   var g = groupInfo();
   if (!g || !gd) return loadingView();
   var top = topBar(null, countdownText(g.event_date), g.name);
-  ui.tabMy = h("button", { class: "tab", type: "button", role: "tab", id: "tab-my", onclick: function () { setView("my"); } });
+  var reg = g.kind === "registry";
+  ui.tabMy = reg ? null : h("button", { class: "tab", type: "button", role: "tab", id: "tab-my", onclick: function () { setView("my"); } });
   ui.tabFam = h("button", { class: "tab", type: "button", role: "tab", id: "tab-family", onclick: function () { setView("members"); } });
   ui.tabPur = h("button", { class: "tab", type: "button", role: "tab", id: "tab-purchases", onclick: function () { setView("purchases"); } });
-  var tabList = [ui.tabMy, ui.tabFam, ui.tabPur];
+  var tabList = reg ? [ui.tabFam, ui.tabPur] : [ui.tabMy, ui.tabFam, ui.tabPur];
   if (g.is_admin) {
     ui.tabManage = h("button", { class: "tab", type: "button", role: "tab", id: "tab-manage", onclick: function () { setView("manage"); } }, "Manage");
     tabList.push(ui.tabManage);
@@ -791,7 +844,7 @@ function groupShell() {
   var back = h("button", { class: "btn ghost back", type: "button", id: "back-dash", onclick: goDashboard }, icon("back"), "All groups");
   var root = h("div", { class: "panel" }, top, ui.confirmRow, back, tabs, ui.panel);
   if (g.archived_at) root.insertBefore(h("div", { class: "note warn", id: "archived-note" }, icon("lock"),
-    h("span", { text: "This group is archived and view-only. No one can join, and nothing can be added, edited or marked as purchased." })), tabs);
+    h("span", { text: (reg ? "This wishlist" : "This group") + " is archived and view-only. No one can join, and nothing can be added, edited or marked as purchased." })), tabs);
   setTimeout(function () { renderPanel(); updateTabs(); }, 0);
   return root;
 }
@@ -804,19 +857,22 @@ function boughtCount() {
   return n;
 }
 function updateTabs() {
-  if (!ui.tabMy || !gd) return;
+  if (!ui.tabFam || !gd) return;
   var v = route.view;
-  var onFam = v === "members" || v.indexOf("member:") === 0;
-  ui.tabMy.setAttribute("aria-selected", v === "my" ? "true" : "false");
+  var reg = isRegistry();
+  var onFam = v === "members" || v.indexOf("member:") === 0 || v.indexOf("edit:") === 0;
+  if (ui.tabMy) ui.tabMy.setAttribute("aria-selected", v === "my" ? "true" : "false");
   ui.tabFam.setAttribute("aria-selected", onFam ? "true" : "false");
   ui.tabPur.setAttribute("aria-selected", v === "purchases" ? "true" : "false");
   if (ui.tabManage) ui.tabManage.setAttribute("aria-selected", v === "manage" ? "true" : "false");
-  ui.tabMy.replaceChildren(document.createTextNode("My list"));
-  var lm = gd.listMeta.get(myId);
-  if (!(lm && lm.submitted_at) && !isArchived()) ui.tabMy.append(h("span", { class: "badge warn", text: "Draft" }));
+  if (ui.tabMy) {
+    ui.tabMy.replaceChildren(document.createTextNode("My list"));
+    var lm = gd.listMeta.get(myId);
+    if (!(lm && lm.submitted_at) && !isArchived()) ui.tabMy.append(h("span", { class: "badge warn", text: "Draft" }));
+  }
   var others = gd.members.filter(function (m) { return m !== myId; });
   var ready = others.filter(function (m) { return listFor(m).state === "ready"; }).length;
-  ui.tabFam.replaceChildren(document.createTextNode("Everyone"), h("span", { class: "badge", title: ready + " of " + others.length + " lists ready", text: ready + "/" + others.length }));
+  ui.tabFam.replaceChildren(document.createTextNode(reg ? "Lists" : "Everyone"), h("span", { class: "badge", title: ready + " of " + others.length + " lists ready", text: ready + "/" + others.length }));
   ui.tabPur.replaceChildren(document.createTextNode("Purchases"), h("span", { class: "badge", text: String(boughtCount()) }));
 }
 function setView(v) {
@@ -827,7 +883,11 @@ function renderPanel() {
   if (!ui.panel || !gd) return;
   ui.panel.replaceChildren();
   var v = route.view;
+  if (isRegistry() && v === "my") v = route.view = "members";
+  if (v.indexOf("edit:") === 0 && (!isRegistry() || !isAdmin() || !gd.recipients.has(v.slice(5)))) v = route.view = "members";
+  if (v.indexOf("edit:") === 0 && isArchived()) v = route.view = "member:" + v.slice(5);
   if (v === "my") ui.panel.append(isArchived() ? readOnlyListView() : editorView());
+  else if (v.indexOf("edit:") === 0) ui.panel.append(editorView());
   else if (v === "members") ui.panel.append(membersView());
   else if (v === "purchases") ui.panel.append(purchasesView());
   else if (v === "manage") ui.panel.append(manageView());
@@ -849,8 +909,31 @@ function readOnlyListView() {
   });
   return wrap;
 }
+function registryEditorView(owner) {
+  var wrap = h("div", { class: "panel" });
+  wrap.append(h("button", { class: "btn ghost back", type: "button", id: "back-lists", onclick: function () { setView("members"); } }, icon("back"), "All lists"));
+  wrap.append(h("div", { class: "page-head" }, h("h2", { text: possessive(owner) + " wishlist" }),
+    h("p", { class: "muted", text: "Add as many wishes as you like. Anyone with the invite link sees changes right away and can mark gifts as purchased. As the admin, you can also see who has marked what." })));
+  ui.items = h("div", { class: "items" });
+  wrap.append(ui.items);
+  wrap.append(h("button", { class: "btn", type: "button", id: "add-item", onclick: function () {
+    var it = blank(); editor.items.push(it); rebuildItems(); updateBar();
+    var f = document.getElementById("f-" + it.key + "-name"); if (f) f.focus();
+  } }, icon("plus"), "Add another item"));
+  ui.count = h("span", { class: "count" });
+  ui.meter = h("div", { class: "meter", hidden: true });
+  ui.submit = h("button", { class: "btn primary", type: "button", id: "submit-list", onclick: submitList });
+  wrap.append(h("div", { class: "bar" }, h("div", null, ui.count, ui.meter), h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, ui.submit)));
+  rebuildItems(); updateBar();
+  return wrap;
+}
 function editorView() {
-  if (!editor) initEditor();
+  if (isRegistry()) {
+    var owner = editingOwner();
+    if (!editor || editor.owner !== owner) initEditor(owner);
+    return registryEditorView(owner);
+  }
+  if (!editor || editor.owner !== myId) initEditor();
   var min = minItems();
   var wrap = h("div", { class: "panel" });
   var pill = h("span", { class: "status-pill " + (editor.submitted ? "live" : "draft"), text: editor.submitted ? "Shared with the group" : "Draft. Nobody else can see it yet" });
@@ -925,6 +1008,16 @@ function itemCard(it, i) {
 }
 function updateBar() {
   if (!ui.count) return;
+  if (editor.registry) {
+    var rr = cleanItems(), nn = rr.complete.length;
+    var dirtyR = sig(rr.complete) !== editor.baseSig || rr.problems > 0;
+    ui.count.textContent = rr.problems > 0 ? plural(rr.problems, "item needs", "items need") + " fixing"
+      : !dirtyR ? (nn ? "All changes saved · " + plural(nn, "item", "items") : "No items yet") : plural(nn, "item", "items") + " ready to save";
+    ui.count.className = "count " + (rr.problems > 0 ? "bad" : !dirtyR && nn ? "ok" : "");
+    ui.submit.textContent = editor.saving ? "Saving…" : "Save changes";
+    ui.submit.disabled = editor.saving || !dirtyR;
+    return;
+  }
   var min = minItems();
   var r = cleanItems(), n = r.complete.length;
   var dirty = sig(r.complete) !== editor.baseSig || r.problems > 0;
@@ -951,12 +1044,15 @@ function updateBar() {
 /* everyone */
 function membersView() {
   var wrap = h("div", { class: "panel" });
-  wrap.append(h("div", { class: "page-head" }, h("h2", { text: "Everyone’s lists" }),
+  var reg = isRegistry();
+  wrap.append(h("div", { class: "page-head" }, h("h2", { text: reg ? "Wishlists" : "Everyone’s lists" }),
     h("p", { class: "muted", text: "Open a list to see what they’d like. Mark a gift as purchased and everyone else will see it, so no one buys it twice." })));
   var others = gd.members.filter(function (m) { return m !== myId; });
   if (!others.length) {
-    wrap.append(h("div", { class: "card empty", id: "alone" }, h("h3", { text: "It’s just you so far" }),
-      h("p", { class: "muted", text: isAdmin() ? "Open the Manage tab to copy the invite link and bring people in." : "Ask the group admin for the invite link to share." })));
+    wrap.append(h("div", { class: "card empty", id: "alone" }, h("h3", { text: reg ? "No lists yet" : "It’s just you so far" }),
+      h("p", { class: "muted", text: reg ? (isAdmin() ? "Add a list for someone below." : "The admin hasn’t added any lists yet.")
+        : isAdmin() ? "Open the Manage tab to copy the invite link and bring people in." : "Ask the group admin for the invite link to share." })));
+    if (reg && isAdmin() && !isArchived()) wrap.append(addListCard());
     return wrap;
   }
   // How many items I have picked from each list, and which shared lists I haven't touched yet.
@@ -991,14 +1087,39 @@ function membersView() {
         h("div", { class: "prog-row" }, h("span", { text: plural(info.items.length, "wish", "wishes") }), h("span", { text: bought + " purchased" })),
         h("div", { class: "progress" }, h("b", { style: "width:" + Math.round(bought / info.items.length * 100) + "%" })));
     } else {
-      chip = h("span", { class: "chip grey", "data-chip": "waiting", text: "No list yet" });
-      body = h("p", { class: "meta", text: nameOf(m) + " hasn’t submitted a list yet." });
+      chip = h("span", { class: "chip grey", "data-chip": "waiting", text: reg ? "No items yet" : "No list yet" });
+      body = h("p", { class: "meta", text: reg ? "Nothing has been added to this list yet." : nameOf(m) + " hasn’t submitted a list yet." });
     }
-    grid.append(h("button", { class: "tag", type: "button", "data-member": m, disabled: info.state === "ready" ? null : true, onclick: function () { setView("member:" + m); } },
+    var canOpen = info.state === "ready" || (reg && isAdmin() && !isArchived());
+    grid.append(h("button", { class: "tag", type: "button", "data-member": m, disabled: canOpen ? null : true, onclick: function () { setView(info.state === "ready" ? "member:" + m : "edit:" + m); } },
       h("div", { class: "who" }, avatar(m, "md"), h("h3", { text: nameOf(m) })), h("div", { class: "chips" }, chip), body));
   });
   wrap.append(grid);
+  if (reg && isAdmin() && !isArchived()) wrap.append(addListCard());
   return wrap;
+}
+function addListCard() {
+  var input = h("input", { id: "new-list-name", type: "text", maxlength: "40", placeholder: "Who is this list for?", autocomplete: "off", "aria-label": "Name of the person the list is for" });
+  var btn = h("button", { class: "btn primary", type: "submit", id: "new-list-go", text: "Add list" });
+  var err = h("p", { class: "err", hidden: true, role: "alert", id: "new-list-err" });
+  var form = h("form", { class: "card stack", id: "new-list-form", novalidate: true }, h("h3", { text: "Add another list" }),
+    h("div", { class: "linkbox" }, input, btn), err);
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var name = input.value.trim();
+    if (!name) { err.textContent = "Enter the name of the person the list is for."; err.hidden = false; return; }
+    err.hidden = true; btn.disabled = true;
+    try {
+      var before = new Set(gd.members);
+      await api(sb.rpc("add_list", { p_group: route.id, p_name: name }));
+      await loadGroup();
+      var added = gd.members.find(function (m) { return !before.has(m); });
+      editor = null;
+      setView(added ? "edit:" + added : "members");
+      toast("List added. Add their wishes below.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; }
+  });
+  return form;
 }
 function claimSide(it) {
   var cl = claimersOf(it), mine = cl.indexOf(myId) >= 0, full = isFull(it);
@@ -1023,6 +1144,7 @@ function claimSide(it) {
 function memberView(member) {
   var info = listFor(member);
   var wrap = h("div", { class: "panel" });
+  var canEdit = isRegistry() && isAdmin() && !isArchived();
   wrap.append(h("button", { class: "btn ghost back", type: "button", onclick: function () { setView("members"); } }, icon("back"), "All lists"));
   if (info.state !== "ready") {
     wrap.append(h("div", { class: "card empty" }, h("h3", { text: nameOf(member) + " hasn’t shared a list yet" }),
@@ -1032,7 +1154,8 @@ function memberView(member) {
   var items = info.items;
   var bought = items.filter(function (it) { return claimersOf(it).length > 0; }).length;
   wrap.append(h("div", { class: "who-head" }, avatar(member, "lg"),
-    h("div", null, h("h2", { text: possessive(member) + " list" }), h("p", { class: "muted", text: plural(items.length, "wish", "wishes") }))));
+    h("div", null, h("h2", { text: possessive(member) + " list" }), h("p", { class: "muted", text: plural(items.length, "wish", "wishes") })),
+    canEdit ? h("button", { class: "btn sm", type: "button", id: "edit-list", style: "margin-left:auto", onclick: function () { setView("edit:" + member); } }, "Edit list") : null));
   wrap.append(h("div", { class: "card" },
     h("div", { class: "prog-row" }, h("span", { text: "Purchased" }), h("span", { text: bought + " of " + items.length })),
     h("div", { class: "progress" }, h("b", { style: "width:" + Math.round(bought / items.length * 100) + "%" }))));
@@ -1120,7 +1243,7 @@ function manageView() {
   if (g.archived_at) {
     linkCard.append(h("p", { class: "muted", text: "This group is archived and view-only, so the invite link no longer lets anyone join. Reopen the group to use it again." }));
   } else {
-    linkCard.append(h("p", { class: "muted", text: "Anyone with this link can join the group after confirming their email. Send it by text or email." }));
+    linkCard.append(h("p", { class: "muted", text: g.kind === "registry" ? "Anyone with this link can view the lists and mark gifts as purchased after confirming their email. They can’t make lists of their own. Send it by text or email." : "Anyone with this link can join the group after confirming their email. Send it by text or email." }));
   }
   if (gd.code) {
     var input = h("input", { id: "invite-link", type: "text", readonly: true, disabled: g.archived_at ? true : null, value: inviteUrl(), "aria-label": "Invite link", onfocus: function (e) { e.target.select(); } });
@@ -1150,13 +1273,16 @@ function manageView() {
   wrap.append(detailsCard(g));
 
   // members
+  var reg = g.kind === "registry";
   var people = h("div", { id: "member-list" });
   var frozen = !!g.archived_at;
-  gd.members.forEach(function (m) {
+  var peopleIds = reg ? gd.everyone.filter(function (m) { return !gd.recipients.has(m); }) : gd.members;
+  if (reg) wrap.append(listsCard(frozen));
+  peopleIds.forEach(function (m) {
     var row = h("div", { class: "person", "data-member": nameOf(m) }, avatar(m, "sm"),
       h("span", { class: "pn", text: nameOf(m) + (m === myId ? " (you)" : "") }),
       m === myId ? h("span", { class: "chip gold", text: "Admin" }) : null,
-      listFor(m).state === "ready" ? h("span", { class: "chip", text: "List shared" }) : h("span", { class: "chip grey", text: "No list yet" }));
+      reg ? null : listFor(m).state === "ready" ? h("span", { class: "chip", text: "List shared" }) : h("span", { class: "chip grey", text: "No list yet" }));
     if (m !== myId) {
       var rm = h("button", { class: "btn sm danger rm-btn", type: "button", text: "Remove", "aria-label": "Remove " + nameOf(m),
         disabled: frozen ? true : null, title: frozen ? "This group is archived" : null });
@@ -1169,7 +1295,8 @@ function manageView() {
     }
     people.append(row);
   });
-  wrap.append(h("div", { class: "card" }, h("h3", { style: "margin-bottom:6px", text: plural(gd.members.length, "member", "members") }), people));
+  wrap.append(h("div", { class: "card" }, h("h3", { style: "margin-bottom:6px", text: reg ? plural(peopleIds.length, "person", "people") + " with access" : plural(gd.members.length, "member", "members") }),
+    reg && peopleIds.length <= 1 ? h("p", { class: "muted", text: "Nobody has opened the invite link yet." }) : null, people));
 
   // settings + archive
   var settings = h("div", { class: "card stack", id: "archive-card" }, h("h3", { text: "Group settings" }),
@@ -1202,7 +1329,7 @@ function detailsCard(g) {
   var err = h("p", { class: "err", hidden: true, role: "alert", id: "d-err" });
   var save = h("button", { class: "btn primary", type: "submit", id: "d-save", text: passed && g.archived_at ? "Save and reopen" : "Save changes", disabled: locked ? true : null });
   var form = h("form", { class: "stack", id: "d-form", novalidate: true },
-    h("div", { class: "field" }, h("label", { for: "d-name", text: "Group name" }),
+    h("div", { class: "field" }, h("label", { for: "d-name", text: g.kind === "registry" ? "Event name" : "Group name" }),
       h("input", { id: "d-name", type: "text", maxlength: "60", value: f.name, disabled: locked ? true : null, autocomplete: "off", oninput: function (e) { f.name = e.target.value; } })),
     h("div", { class: "field" }, h("label", { for: "d-date", text: "Event date" }),
       h("input", { id: "d-date", type: "date", min: todayStr(), value: f.date, disabled: locked ? true : null, oninput: function (e) { f.date = e.target.value; } })),
@@ -1229,13 +1356,39 @@ function detailsCard(g) {
   card.append(form);
   return card;
 }
-async function removeMember(m, conf) {
+function listsCard(frozen) {
+  var card = h("div", { class: "card", id: "lists-card" }, h("h3", { style: "margin-bottom:6px", text: plural(gd.members.length, "list", "lists") }));
+  gd.members.forEach(function (m) {
+    var n = (gd.items.get(m) || []).length;
+    var input = h("input", { type: "text", maxlength: "40", value: nameOf(m), "aria-label": "Name for this list", class: "rename-input", disabled: frozen ? true : null });
+    var save = h("button", { class: "btn sm", type: "button", text: "Rename", disabled: true });
+    input.addEventListener("input", function () { save.disabled = frozen || !input.value.trim() || input.value.trim() === nameOf(m); });
+    save.addEventListener("click", async function () {
+      save.disabled = true;
+      try {
+        await api(sb.rpc("rename_list", { p_group: route.id, p_member: m, p_name: input.value.trim() }));
+        await loadGroup(); renderPanel(); updateTabs(); toast("List renamed.");
+      } catch (e) { toast(humanize(e)); save.disabled = false; }
+    });
+    var edit = h("button", { class: "btn sm", type: "button", text: "Edit items", disabled: frozen ? true : null, onclick: function () { setView("edit:" + m); } });
+    var del = h("button", { class: "btn sm danger rm-btn", type: "button", text: "Delete", "aria-label": "Delete " + nameOf(m) + "’s list", disabled: frozen ? true : null });
+    var conf = h("div", { class: "confirm rm-confirm", hidden: true },
+      h("span", { text: "Delete " + nameOf(m) + "’s list and its " + plural(n, "wish", "wishes") + "? Anything people marked as purchased on it is cleared too." }),
+      h("button", { class: "btn sm primary rm-yes", type: "button", text: "Yes, delete", onclick: function () { removeMember(m, conf, "list"); } }),
+      h("button", { class: "btn sm ghost", type: "button", text: "Cancel", onclick: function () { conf.hidden = true; del.hidden = false; } }));
+    del.addEventListener("click", function () { conf.hidden = false; del.hidden = true; });
+    card.append(h("div", { class: "person", "data-list": nameOf(m) }, input, save, h("span", { class: "chip grey", text: plural(n, "wish", "wishes") }), edit, del, conf));
+  });
+  if (!gd.members.length) card.append(h("p", { class: "muted", text: "No lists yet. Add one from the Lists tab." }));
+  return card;
+}
+async function removeMember(m, conf, what) {
   var who = nameOf(m);
   conf.querySelectorAll("button").forEach(function (b) { b.disabled = true; });
   try {
     await api(sb.rpc("remove_member", { p_group: route.id, p_member: m }));
     await loadGroup(); renderPanel(); updateTabs();
-    toast(who + " was removed from the group.");
+    toast(what === "list" ? who + "’s list was deleted." : who + " was removed from the group.");
   } catch (e) {
     toast(humanize(e));
     conf.querySelectorAll("button").forEach(function (b) { b.disabled = false; });

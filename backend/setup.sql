@@ -69,6 +69,12 @@ create table if not exists public.groups (
 );
 -- True when the group was archived because its event date passed (not by the admin).
 alter table public.groups add column if not exists auto_archived boolean not null default false;
+-- 'group' = people who each make a list for each other. 'registry' = a one-way wishlist: the admin writes the
+-- lists (for kids, say) and everyone with the link can view them and pick gifts, but cannot make lists of their own.
+alter table public.groups add column if not exists kind text not null default 'group';
+do $$ begin
+  alter table public.groups add constraint groups_kind_check check (kind in ('group', 'registry'));
+exception when duplicate_object then null; end $$;
 
 -- The join link code. Only the group's admin can read it.
 create table if not exists public.group_invites (
@@ -83,6 +89,9 @@ create table if not exists public.group_members (
   joined_at timestamptz not null default now(),
   primary key (group_id, member_id)
 );
+-- In a registry, the people the lists are FOR are stored as members flagged is_recipient. They are placeholders
+-- (a name, no real email) and can never sign in.
+alter table public.group_members add column if not exists is_recipient boolean not null default false;
 
 create table if not exists public.wish_lists (
   group_id     uuid not null,
@@ -255,6 +264,22 @@ drop trigger if exists wish_items_touch on public.wish_items;
 create trigger wish_items_touch before update on public.wish_items
   for each row execute function public.touch_item();
 
+-- Who may add, change or remove the items on a list:
+--   a normal group: only the list's owner;  a registry: only the admin, and only on a recipient's list.
+create or replace function public.can_edit_items(p_group uuid, p_owner uuid)
+returns boolean
+language sql stable security definer
+set search_path = public, pg_temp
+as $$
+  select public.group_open(p_group) and exists (
+    select 1 from public.groups g
+    where g.id = p_group and (
+      (g.kind = 'group' and p_owner = public.my_id() and public.is_member(p_group))
+      or (g.kind = 'registry' and g.admin_id = public.my_id()
+          and exists (select 1 from public.group_members m where m.group_id = p_group and m.member_id = p_owner and m.is_recipient))
+    ))
+$$;
+
 -- A submitted list may never drop below the group's minimum.
 create or replace function public.guard_item_delete()
 returns trigger
@@ -263,7 +288,7 @@ set search_path = public, pg_temp
 as $$
 declare v_min int;
 begin
-  select item_min into v_min from public.groups where id = old.group_id;
+  select item_min into v_min from public.groups where id = old.group_id and kind = 'group';
   if v_min is not null
      and public.list_submitted(old.group_id, old.owner)
      and (select count(*) from public.wish_items where group_id = old.group_id and owner = old.owner) <= v_min then
@@ -436,37 +461,42 @@ end
 $$;
 
 -- Everything the dashboard shows, one row per group you are in.
-drop function if exists public.my_groups();   -- its columns changed (added admin_name)
+drop function if exists public.my_groups();   -- its columns changed (added admin_name, kind)
 create or replace function public.my_groups()
 returns table (
   group_id uuid, name text, event_date date, created_at timestamptz, archived_at timestamptz,
-  is_admin boolean, item_min int, member_count int, left_to_shop int, list_submitted boolean, admin_name text
+  is_admin boolean, item_min int, member_count int, left_to_shop int, list_submitted boolean, admin_name text, kind text
 )
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
   select g.id, g.name, g.event_date, g.created_at, g.archived_at,
          g.admin_id = public.my_id(), g.item_min,
-         (select count(*)::int from public.group_members x where x.group_id = g.id),
+         -- in a registry "members" counts the lists (the people the wishes are for)
+         (select count(*)::int from public.group_members x where x.group_id = g.id and (g.kind = 'group' or x.is_recipient)),
          (select count(*)::int from public.group_members x
-           where x.group_id = g.id and x.member_id <> public.my_id()
+           where x.group_id = g.id and x.member_id <> public.my_id() and (g.kind = 'group' or x.is_recipient)
+             and (g.kind = 'group' or exists (select 1 from public.wish_items w where w.group_id = g.id and w.owner = x.member_id))
              and not exists (select 1 from public.claims c join public.wish_items i on i.id = c.item_id
                              where i.group_id = g.id and i.owner = x.member_id and c.buyer = public.my_id())),
-         public.list_submitted(g.id, public.my_id()),
-         (select p.name from public.profiles p where p.id = g.admin_id)
+         (g.kind = 'registry' or public.list_submitted(g.id, public.my_id())),
+         (select p.name from public.profiles p where p.id = g.admin_id),
+         g.kind
   from public.groups g
   join public.group_members gm on gm.group_id = g.id and gm.member_id = public.my_id()
   order by (g.archived_at is not null), g.event_date, g.name
 $$;
 
 -- What a join link points to. Safe to call before signing in; it reveals only the group's name and date.
+drop function if exists public.preview_invite(text);
 create or replace function public.preview_invite(p_code text)
-returns table (group_name text, event_date date, archived boolean, member_count int)
+returns table (group_name text, event_date date, archived boolean, member_count int, kind text)
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
   select g.name, g.event_date, (g.archived_at is not null or g.event_date < public.today_local()),
-         (select count(*)::int from public.group_members x where x.group_id = g.id)
+         (select count(*)::int from public.group_members x where x.group_id = g.id and (g.kind = 'group' or x.is_recipient)),
+         g.kind
   from public.group_invites i join public.groups g on g.id = i.group_id
   where i.code = p_code
 $$;
@@ -583,6 +613,71 @@ begin
   delete from public.claims c using public.wish_items i
    where c.item_id = i.id and i.group_id = p_group and c.buyer = p_member;
   delete from public.group_members where group_id = p_group and member_id = p_member;
+  -- A wishlist's placeholder person has no other use once their list is gone.
+  delete from public.profiles where id = p_member and email like '%@lists.invalid';
+end
+$$;
+
+-- Admin only. Makes a one-way wishlist: an event name, a date, and the first person a list is for.
+create or replace function public.create_registry(p_name text, p_event date, p_for text)
+returns uuid
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare
+  m uuid := public.my_id();
+  g uuid;
+begin
+  if public.me() is null then raise exception 'Not authenticated'; end if;
+  if m is null then raise exception 'Add your name first'; end if;
+  if length(trim(coalesce(p_name, ''))) not between 1 and 60 then raise exception 'Enter an event name up to 60 characters'; end if;
+  if p_event is null then raise exception 'Choose the event date'; end if;
+  if p_event < public.today_local() then raise exception 'The event date has already passed. Choose a date that is today or later'; end if;
+  if length(trim(coalesce(p_for, ''))) not between 1 and 40 then raise exception 'Enter the name of the person the list is for, up to 40 characters'; end if;
+
+  insert into public.groups (name, event_date, item_min, admin_id, kind)
+  values (trim(p_name), p_event, 1, m, 'registry') returning id into g;
+  insert into public.group_members (group_id, member_id) values (g, m);
+  insert into public.group_invites (group_id, code) values (g, substr(replace(gen_random_uuid()::text, '-', ''), 1, 24));
+  perform public.add_list(g, p_for);
+  return g;
+end
+$$;
+
+-- Admin only. Adds another person's list to a wishlist. Returns that list's id.
+create or replace function public.add_list(p_group uuid, p_name text)
+returns uuid
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare r uuid;
+begin
+  if not public.is_admin(p_group) then raise exception 'Only the group admin can do that'; end if;
+  if not exists (select 1 from public.groups where id = p_group and kind = 'registry') then raise exception 'Lists can only be added to a wishlist'; end if;
+  if not public.group_open(p_group) then raise exception 'This group is archived, so lists can no longer be added'; end if;
+  if length(trim(coalesce(p_name, ''))) not between 1 and 40 then raise exception 'Enter the name of the person the list is for, up to 40 characters'; end if;
+  if (select count(*) from public.group_members where group_id = p_group and is_recipient) >= 50 then raise exception 'A wishlist can have up to 50 lists'; end if;
+  insert into public.profiles (email, name)
+  values ('list-' || gen_random_uuid()::text || '@lists.invalid', trim(p_name)) returning id into r;
+  insert into public.group_members (group_id, member_id, is_recipient) values (p_group, r, true);
+  insert into public.wish_lists (group_id, owner, submitted_at) values (p_group, r, now());
+  return r;
+end
+$$;
+
+-- Admin only. Renames the person a list is for.
+create or replace function public.rename_list(p_group uuid, p_member uuid, p_name text)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.is_admin(p_group) then raise exception 'Only the group admin can do that'; end if;
+  if not public.group_open(p_group) then raise exception 'This group is archived, so lists can no longer be changed'; end if;
+  if length(trim(coalesce(p_name, ''))) not between 1 and 40 then raise exception 'Enter the name of the person the list is for, up to 40 characters'; end if;
+  update public.profiles set name = trim(p_name)
+   where id = p_member and exists (select 1 from public.group_members where group_id = p_group and member_id = p_member and is_recipient);
+  if not found then raise exception 'That list is not in this wishlist'; end if;
 end
 $$;
 
@@ -602,6 +697,9 @@ begin
   end if;
   if not public.group_open(p_group) then
     raise exception 'This group is archived, so lists are closed';
+  end if;
+  if exists (select 1 from public.groups where id = p_group and kind = 'registry') then
+    raise exception 'Lists in a wishlist are written by its admin';
   end if;
 
   select item_min into v_min from public.groups where id = p_group;
@@ -668,17 +766,17 @@ create policy items_read on public.wish_items
 drop policy if exists items_insert on public.wish_items;
 create policy items_insert on public.wish_items
   for insert to authenticated
-  with check (owner = public.my_id() and public.is_member(group_id) and public.group_open(group_id));
+  with check (public.can_edit_items(group_id, owner));
 
 drop policy if exists items_update on public.wish_items;
 create policy items_update on public.wish_items
   for update to authenticated
-  using (owner = public.my_id() and public.group_open(group_id))
-  with check (owner = public.my_id() and public.is_member(group_id) and public.group_open(group_id));
+  using (public.can_edit_items(group_id, owner))
+  with check (public.can_edit_items(group_id, owner));
 
 drop policy if exists items_delete on public.wish_items;
 create policy items_delete on public.wish_items
-  for delete to authenticated using (owner = public.my_id() and public.group_open(group_id));
+  for delete to authenticated using (public.can_edit_items(group_id, owner));
 
 -- Claims: never visible to the owner of the item, nobody can claim their own wishes,
 -- and nothing can be claimed or released once the group is archived.
@@ -818,7 +916,8 @@ grant execute on function
   public.list_submitted(uuid, uuid), public.wish_owner(uuid), public.item_group(uuid), public.shares_group(uuid),
   public.set_profile(text), public.create_group(text, date, int), public.my_groups(),
   public.join_group(text), public.generate_invite(uuid), public.set_group_archived(uuid, boolean), public.submit_list(uuid),
-  public.today_local(), public.sweep_archives(), public.edit_group(uuid, text, date), public.remove_member(uuid, uuid)
+  public.today_local(), public.sweep_archives(), public.edit_group(uuid, text, date), public.remove_member(uuid, uuid),
+  public.can_edit_items(uuid, uuid), public.create_registry(text, date, text), public.add_list(uuid, text), public.rename_list(uuid, uuid, text)
   to authenticated;
 grant execute on function public.preview_invite(text) to anon, authenticated;
 
