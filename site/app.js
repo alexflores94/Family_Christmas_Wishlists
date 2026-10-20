@@ -529,7 +529,7 @@ function render() {
   if (phase === "error") { app.append(errorView()); return; }
   renderMain();
 }
-function topBar(eyebrow, countdown) {
+function topBar(eyebrow, countdown, title) {
   var chip = h("button", { class: "me-chip", type: "button", id: "me-chip", "aria-label": "Account menu for " + (myName || "you"), onclick: function () { ui.confirmRow.hidden = !ui.confirmRow.hidden; } },
     avatar(myId, "sm"), h("span", { class: "nm", text: myName || "Me" }));
   ui.confirmRow = h("div", { class: "confirm", hidden: true },
@@ -537,7 +537,7 @@ function topBar(eyebrow, countdown) {
     h("button", { class: "btn sm primary", type: "button", id: "sign-out", onclick: signOut, text: "Sign out" }),
     h("button", { class: "btn sm ghost", type: "button", onclick: function () { ui.confirmRow.hidden = true; }, text: "Close" }));
   var top = h("div", { class: "top" },
-    h("div", { class: "brand" }, h("span", { class: "eyebrow", text: eyebrow }), h("h1", { text: "Wishlist Groups" })),
+    h("div", { class: "brand" }, title ? null : h("span", { class: "eyebrow", text: eyebrow }), h("h1", { text: title || "Wishlist Groups" })),
     h("div", { class: "top-right" }, countdown ? h("span", { class: "countdown", text: countdown }) : null, chip));
   return top;
 }
@@ -688,6 +688,7 @@ function dashboardView() {
       chips,
       h("dl", { class: "stats" },
         h("div", null, h("dt", { text: "Event date" }), h("dd", { class: "s-event" }, fmtDay(g.event_date), g.archived_at ? null : h("span", { class: "muted", style: "display:block;font-weight:400;font-size:13px", text: d > 1 ? "in " + d + " days" : d === 1 ? "tomorrow" : d === 0 ? "today" : "passed" }))),
+        h("div", null, h("dt", { text: "Created by" }), h("dd", { class: "s-creator", text: g.admin_name || "—" })),
         h("div", null, h("dt", { text: "Created" }), h("dd", { class: "s-created", text: fmtDay(g.created_at) })),
         h("div", null, h("dt", { text: "Members" }), h("dd", { class: "s-members", text: String(g.member_count) })),
         h("div", null, h("dt", { text: "Left to shop for" }), h("dd", { class: "s-left", text: left })))));
@@ -776,7 +777,7 @@ function joinView() {
 function groupShell() {
   var g = groupInfo();
   if (!g || !gd) return loadingView();
-  var top = topBar(g.name, countdownText(g.event_date));
+  var top = topBar(null, countdownText(g.event_date), g.name);
   ui.tabMy = h("button", { class: "tab", type: "button", role: "tab", id: "tab-my", onclick: function () { setView("my"); } });
   ui.tabFam = h("button", { class: "tab", type: "button", role: "tab", id: "tab-family", onclick: function () { setView("members"); } });
   ui.tabPur = h("button", { class: "tab", type: "button", role: "tab", id: "tab-purchases", onclick: function () { setView("purchases"); } });

@@ -436,10 +436,11 @@ end
 $$;
 
 -- Everything the dashboard shows, one row per group you are in.
+drop function if exists public.my_groups();   -- its columns changed (added admin_name)
 create or replace function public.my_groups()
 returns table (
   group_id uuid, name text, event_date date, created_at timestamptz, archived_at timestamptz,
-  is_admin boolean, item_min int, member_count int, left_to_shop int, list_submitted boolean
+  is_admin boolean, item_min int, member_count int, left_to_shop int, list_submitted boolean, admin_name text
 )
 language sql stable security definer
 set search_path = public, pg_temp
@@ -451,7 +452,8 @@ as $$
            where x.group_id = g.id and x.member_id <> public.my_id()
              and not exists (select 1 from public.claims c join public.wish_items i on i.id = c.item_id
                              where i.group_id = g.id and i.owner = x.member_id and c.buyer = public.my_id())),
-         public.list_submitted(g.id, public.my_id())
+         public.list_submitted(g.id, public.my_id()),
+         (select p.name from public.profiles p where p.id = g.admin_id)
   from public.groups g
   join public.group_members gm on gm.group_id = g.id and gm.member_id = public.my_id()
   order by (g.archived_at is not null), g.event_date, g.name
