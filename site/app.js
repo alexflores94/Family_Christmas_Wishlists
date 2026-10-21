@@ -495,16 +495,33 @@ async function submitList() {
   editor.saving = false;
   renderPanel(); updateTabs();
 }
+// The price the owner listed ("$24.99", "€49.50 as of ...") as a number, or null when there isn't one.
+function listedPrice(item) {
+  var m = /\d[\d.,]*/.exec(item.price || "");
+  if (!m) return null;
+  var t = m[0].replace(/[.,]+$/, "");
+  if (/,\d{1,2}$/.test(t) && !/\.\d{1,2}$/.test(t)) t = t.replace(/\./g, "").replace(",", ".");
+  else t = t.replace(/,/g, "");
+  var n = Number(t);
+  return isFinite(n) && n > 0 && n < 10000000 ? toCents(n) / 100 : null;
+}
+// What I paid: what I saved, otherwise the listed price.
+function paidAmount(item) {
+  if (gd.paid.has(item.id)) return gd.paid.get(item.id);
+  return listedPrice(item);
+}
 async function savePaid(item, input) {
   var raw = input.value.trim();
   var had = gd.paid.has(item.id);
-  function revert() { input.value = had ? gd.paid.get(item.id).toFixed(2) : ""; }
+  function shown() { var v = paidAmount(item); return v === null ? "" : v.toFixed(2); }
+  function revert() { input.value = shown(); }
   if (isArchived()) { toast("This group is archived, so nothing can be changed."); revert(); return; }
   try {
     if (raw === "") {
-      if (!had) return;
+      if (!had) { input.value = shown(); return; }
       await api(sb.from("claim_prices").delete().eq("item_id", item.id).eq("buyer", myId));
       gd.paid.delete(item.id);
+      input.value = shown();    // back to the listed price, if there is one
     } else {
       var n = Number(raw);
       if (!isFinite(n) || n < 0 || n >= 10000000) { toast("Enter the amount you paid, like 24.99."); revert(); return; }
@@ -522,7 +539,8 @@ function paidInput(item) {
   var frozen = isArchived();
   var input = h("input", { type: "number", min: "0", step: "0.01", inputmode: "decimal", placeholder: "0.00", class: "paid-input", "data-paid": item.name,
     "aria-label": "Price you paid for " + item.name, disabled: frozen ? true : null,
-    value: gd.paid.has(item.id) ? gd.paid.get(item.id).toFixed(2) : "" });
+    value: paidAmount(item) === null ? "" : paidAmount(item).toFixed(2) });
+  if (!gd.paid.has(item.id) && listedPrice(item) !== null) input.title = "Filled in from the listed price. Change it if you paid something different.";
   input.addEventListener("change", function () { savePaid(item, input); });
   input.addEventListener("keydown", function (e) { if (e.key === "Enter") { e.preventDefault(); input.blur(); } });
   return h("label", { class: "paid", title: "Only you can see what you paid" }, "Paid $", input);
@@ -614,6 +632,10 @@ async function toggleBought(item, btn) {
   var r = mine
     ? await sb.from("claims").delete().eq("item_id", item.id).eq("buyer", myId)
     : await sb.from("claims").insert({ item_id: item.id, buyer: myId });
+  // Start the amount paid at the listed price, so it doesn't change if the owner edits the price later.
+  if (!mine && !r.error && listedPrice(item) !== null) {
+    try { await sb.from("claim_prices").upsert({ item_id: item.id, buyer: myId, amount: listedPrice(item) }); } catch (e) { /* the amount can be entered by hand */ }
+  }
   if (r.error) {
     if (r.error.code === "23505") toast("You already marked that one.");
     else toast(humanize(r.error));
@@ -1353,7 +1375,7 @@ function purchasesView() {
     var info = listFor(m); if (info.state !== "ready") return;
     var bought = info.items.filter(iBought);
     var cents = 0, priced = 0;
-    bought.forEach(function (it) { if (gd.paid.has(it.id)) { cents += toCents(gd.paid.get(it.id)); priced++; } });
+    bought.forEach(function (it) { var v = paidAmount(it); if (v !== null) { cents += toCents(v); priced++; } });
     data.push({ member: m, total: info.items.length, bought: bought, cents: cents, priced: priced });
   });
   var n = data.reduce(function (s, p) { return s + p.bought.length; }, 0);
