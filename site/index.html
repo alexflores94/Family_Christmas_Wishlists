@@ -169,6 +169,14 @@ p{margin:0}
 .who-head{display:flex;align-items:center;gap:14px}
 .who-head h2{font-size:28px}
 .wish{display:flex;gap:14px;align-items:flex-start;justify-content:space-between}
+.wish-img{width:96px;height:96px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:12px;flex:none;padding:4px}
+.bi-img{width:48px;height:48px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:8px;flex:none;padding:2px}
+.pv{display:flex;gap:12px;align-items:center;flex-wrap:wrap}
+.pv[hidden]{display:none}
+.pv-img{width:72px;height:72px;object-fit:contain;background:#fff;border:1px solid var(--line);border-radius:10px;padding:3px;flex:none}
+.pv-img[hidden]{display:none}
+.pv-body{display:flex;flex-direction:column;gap:6px;min-width:0;flex:1}
+.pv-msg{font-size:13px}
 .wish-main{display:flex;flex-direction:column;gap:6px;min-width:0;flex:1}
 .wish h3{font-size:18px;overflow-wrap:anywhere}
 .wish p.desc{color:var(--muted);overflow-wrap:anywhere;white-space:pre-wrap}
@@ -229,6 +237,7 @@ p{margin:0}
 @media (prefers-reduced-motion:reduce){.skeleton{animation:none}}
 @media (max-width:520px){
   .wish{flex-direction:column}
+  .wish-img{width:80px;height:80px}
   .wish-side{align-items:flex-start;flex-direction:row;flex-wrap:wrap}
   .hero h1{font-size:28px}
 }

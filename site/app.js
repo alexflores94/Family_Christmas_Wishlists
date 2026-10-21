@@ -78,7 +78,7 @@ function toast(msg) {
   clearTimeout(toastTimer); toastTimer = setTimeout(function () { toastEl.hidden = true; }, 3600);
 }
 function rid() { return "n" + Math.random().toString(36).slice(2, 10); }
-function blank() { return { id: null, key: rid(), name: "", description: "", link: "", qty: "1", unlimited: false }; }
+function blank() { return { id: null, key: rid(), name: "", description: "", link: "", qty: "1", unlimited: false, price: "", asOf: "", image: "", autoPrice: false, looked: "" }; }
 function normLink(s) {
   s = (s || "").trim(); if (!s) return "";
   if (!/^[a-z][a-z0-9+.\-]*:/i.test(s)) s = "https://" + s;
@@ -156,7 +156,7 @@ async function loadGroup() {
     sb.from("group_members").select("member_id,is_recipient,managed_by").eq("group_id", id),
     sb.from("profiles").select("id,name"),
     sb.from("wish_lists").select("owner,submitted_at").eq("group_id", id),
-    sb.from("wish_items").select("id,owner,name,description,link,price,price_as_of,quantity,position,created_at").eq("group_id", id).order("position").order("created_at"),
+    sb.from("wish_items").select("id,owner,name,description,link,image_url,price,price_as_of,quantity,position,created_at").eq("group_id", id).order("position").order("created_at"),
     sb.from("claims").select("item_id,buyer"),
     sb.from("claim_prices").select("item_id,amount"),
     isAdmin() ? sb.from("group_invites").select("code").eq("group_id", id) : Promise.resolve({ data: [] }),
@@ -389,11 +389,12 @@ function cleanItems() {
   editor.items.forEach(function (it) {
     if (isBlankRow(it)) return;
     var n = it.name.trim(), d = it.description.trim(), nl = normLink(it.link), q = parseQty(it);
-    if (n && d && nl !== null && q.ok) complete.push({ id: it.id, name: n, description: d, link: nl, quantity: q.value, ref: it }); else problems++;
+    var pr = (it.price || "").trim();
+    if (n && d && nl !== null && q.ok && pr.length <= 60) complete.push({ id: it.id, name: n, description: d, link: nl, quantity: q.value, price: pr, asOf: pr ? (it.asOf || "") : "", image: it.image || "", ref: it }); else problems++;
   });
   return { complete: complete, problems: problems };
 }
-function sig(list) { return JSON.stringify(list.map(function (i) { return [i.id, i.name, i.description, i.link || "", i.quantity]; })); }
+function sig(list) { return JSON.stringify(list.map(function (i) { return [i.id, i.name, i.description, i.link || "", i.quantity, i.price || "", i.asOf || "", i.image || ""]; })); }
 function startBlanks() { return Math.min(minItems(), 3); }
 function initEditor(owner) {
   owner = owner || myId;
@@ -403,7 +404,8 @@ function initEditor(owner) {
   var submitted = reg || !!(lm && lm.submitted_at);
   var items = mine.map(function (i) {
     return { id: i.id, key: i.id, name: i.name, description: i.description, link: i.link || "",
-      qty: i.quantity === null ? "1" : String(i.quantity), unlimited: i.quantity === null };
+      qty: i.quantity === null ? "1" : String(i.quantity), unlimited: i.quantity === null,
+      price: i.price || "", asOf: i.price_as_of || "", image: i.image_url || "", autoPrice: false, looked: i.link || "" };
   });
   while (!submitted && items.length < startBlanks()) items.push(blank());
   if (items.length === 0) items.push(blank());
@@ -426,14 +428,14 @@ async function persistItems(complete) {
   for (i = 0; i < complete.length; i++) {
     var c = complete[i];
     if (!c.id) continue;
-    r = await sb.from("wish_items").update({ name: c.name, description: c.description, link: c.link || null, quantity: c.quantity, position: i }).eq("id", c.id);
+    r = await sb.from("wish_items").update({ name: c.name, description: c.description, link: c.link || null, quantity: c.quantity, position: i, price: c.price || null, price_as_of: c.asOf || null, image_url: c.image || null }).eq("id", c.id);
     if (r.error) throw r.error;
   }
   var fresh = [];
   complete.forEach(function (c, idx) { if (!c.id) fresh.push({ idx: idx, c: c }); });
   if (fresh.length) {
     r = await sb.from("wish_items").insert(fresh.map(function (f) {
-      return { group_id: route.id, owner: editor.owner, name: f.c.name, description: f.c.description, link: f.c.link || null, quantity: f.c.quantity, position: f.idx };
+      return { group_id: route.id, owner: editor.owner, name: f.c.name, description: f.c.description, link: f.c.link || null, quantity: f.c.quantity, position: f.idx, price: f.c.price || null, price_as_of: f.c.asOf || null, image_url: f.c.image || null };
     })).select("id,position");
     if (r.error) throw r.error;
     (r.data || []).forEach(function (row) {
@@ -596,7 +598,7 @@ function buyCard(it) {
     it.link ? h("a", { class: "link", href: it.link, target: "_blank", rel: "noopener noreferrer", "data-item-link": it.name }, "View item", icon("ext")) : null,
     trackLink);
   var card = h("li", { class: "buyitem", "data-bought": it.name },
-    h("div", { class: "bi-head" }, h("span", { class: "bi-name", text: it.name }), h("span", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" }, st, paidInput(it))),
+    h("div", { class: "bi-head" }, h("span", { style: "display:flex;gap:10px;align-items:center;min-width:0" }, itemPhoto(it, "bi-img"), h("span", { class: "bi-name", text: it.name })), h("span", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" }, st, paidInput(it))),
     meta,
     h("div", { class: "bi-fields" }, note, track),
     h("label", { class: "chk" }, arrived, "It has arrived and I have it"));
@@ -1058,20 +1060,34 @@ function rebuildItems() {
   ui.items.replaceChildren();
   editor.items.forEach(function (it, i) { ui.items.append(itemCard(it, i)); });
 }
+/* photo and price from the item's link, via the /api/preview helper */
+var CURRENCY_SIGNS = { USD: "$", EUR: "€", GBP: "£", CAD: "CA$", AUD: "A$", JPY: "¥" };
+function priceText(price, currency) {
+  var sign = !currency ? "$" : CURRENCY_SIGNS[currency];
+  return sign ? sign + price : price + " " + currency;
+}
+async function lookupLink(link) {
+  var ses = await sb.auth.getSession();
+  var token = ses && ses.data && ses.data.session && ses.data.session.access_token;
+  var r = await fetch("/api/preview?url=" + encodeURIComponent(link), { headers: { Authorization: "Bearer " + (token || ""), apikey: CFG.SUPABASE_ANON_KEY } });
+  if (!r.ok) throw new Error("lookup " + r.status);
+  return r.json();
+}
 function itemCard(it, i) {
   var k = it.key;
   var errName = h("p", { class: "err", hidden: true, text: "Give this item a name." });
   var errDesc = h("p", { class: "err", hidden: true, text: "Add a short description, such as size, color or model." });
   var errLink = h("p", { class: "err", hidden: true, text: "That link doesn’t look right. Paste the full web address." });
   var errQty = h("p", { class: "err", hidden: true, text: "Quantity must be a whole number, 1 or more." });
-  var fName = h("div", { class: "field" }), fDesc = h("div", { class: "field" }), fLink = h("div", { class: "field" }), fQty = h("div", { class: "field" });
+  var fName = h("div", { class: "field" }), fDesc = h("div", { class: "field" }), fLink = h("div", { class: "field" }), fQty = h("div", { class: "field" }), fPrice = h("div", { class: "field" });
+  var errPrice = h("p", { class: "err", hidden: true, text: "Keep the price under 60 characters." });
   var inName = h("input", { id: "f-" + k + "-name", type: "text", maxlength: "80", value: it.name, autocomplete: "off", placeholder: "Item name",
     oninput: function (e) { it.name = e.target.value; changed(); } });
   var inDesc = h("textarea", { id: "f-" + k + "-desc", maxlength: "300", rows: "2", placeholder: "Size, color, model, or why you want it",
     oninput: function (e) { it.description = e.target.value; changed(); } });
   inDesc.value = it.description;
   var inLink = h("input", { id: "f-" + k + "-link", type: "url", inputmode: "url", maxlength: "2000", value: it.link, autocomplete: "off", placeholder: "https://",
-    oninput: function (e) { it.link = e.target.value; changed(); }, onblur: function () { it._lt = true; paint(); } });
+    oninput: function (e) { it.link = e.target.value; changed(); }, onblur: function () { it._lt = true; paint(); autoLookup(); } });
   var inQty = h("input", { id: "f-" + k + "-qty", type: "number", min: "1", max: "9999", step: "1", inputmode: "numeric", value: it.qty, "aria-label": "Quantity",
     disabled: it.unlimited ? true : null,
     oninput: function (e) { it.qty = e.target.value; changed(); } });
@@ -1082,12 +1098,54 @@ function itemCard(it, i) {
   fLink.append(h("label", { for: "f-" + k + "-link" }, "Web link ", h("span", { class: "opt", text: "(optional)" })), inLink, errLink);
   fQty.append(h("label", { for: "f-" + k + "-qty" }, "Quantity ", h("span", { class: "opt", text: "(optional)" })),
     h("div", { class: "qty" }, inQty, h("label", { class: "chk", for: "f-" + k + "-unl" }, inUnl, "Unlimited")), errQty);
+  // price (optional, editable) and the photo found from the link
+  var inPrice = h("input", { id: "f-" + k + "-price", type: "text", maxlength: "60", value: it.price, autocomplete: "off", placeholder: "$24.99",
+    oninput: function (e) { it.price = e.target.value; it.asOf = ""; it.autoPrice = false; changed(); } });
+  fPrice.append(h("label", { for: "f-" + k + "-price" }, "Price ", h("span", { class: "opt", text: "(optional)" })), inPrice, errPrice);
+  var thumb = h("img", { class: "pv-img", alt: "", referrerpolicy: "no-referrer", hidden: true });
+  thumb.addEventListener("error", function () { thumb.hidden = true; });
+  var pvMsg = h("span", { class: "pv-msg muted" });
+  var pvBtn = h("button", { class: "btn sm", type: "button", id: "f-" + k + "-lookup", text: "Get photo and price from link", onclick: function () { lookup(true); } });
+  var pvRm = h("button", { class: "btn sm ghost", type: "button", text: "Remove photo", hidden: true, onclick: function () { it.image = ""; paintPv(); changed(); } });
+  var pv = h("div", { class: "pv" }, thumb, h("div", { class: "pv-body" }, pvMsg, h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, pvBtn, pvRm)));
+  function paintPv() {
+    var ok = normLink(it.link);
+    pvBtn.hidden = !ok;
+    pvBtn.disabled = !!it._busy;
+    thumb.hidden = !it.image;
+    if (it.image) { thumb.src = it.image; thumb.alt = it.name || "Item photo"; }
+    pvRm.hidden = !it.image;
+    pv.hidden = !ok && !it.image;
+  }
+  function autoLookup() {
+    var nl = normLink(it.link);
+    if (nl && nl !== it.looked) lookup(false);
+  }
+  async function lookup(force) {
+    var nl = normLink(it.link);
+    if (!nl || it._busy) return;
+    it._busy = true; it.looked = nl; pvMsg.textContent = "Looking up the photo and price…"; paintPv();
+    try {
+      var r = await lookupLink(nl);
+      var gotImg = false, gotPrice = false;
+      if (r && r.image && (force || !it.image)) { it.image = r.image; gotImg = true; }
+      if (r && r.price && (force || !it.price.trim() || it.autoPrice)) {
+        it.price = priceText(r.price, r.currency); it.asOf = fmtDay(todayStr()); it.autoPrice = true; inPrice.value = it.price; gotPrice = true;
+      }
+      pvMsg.textContent = gotImg && gotPrice ? "Found a photo and price. Check them before saving."
+        : gotImg ? "Found a photo. This site didn’t share a price, so you can type one in."
+        : gotPrice ? "Found a price. This site didn’t share a photo."
+        : r && r.reason === "blocked" ? "That store doesn’t let us read its page, so you’ll need to add the price yourself."
+        : "Couldn’t read a photo or price from that link. You can still type the price in.";
+    } catch (e) { pvMsg.textContent = "Couldn’t look that link up right now. You can still type the price in."; }
+    it._busy = false; paintPv(); changed();
+  }
   var del = h("button", { class: "btn ghost sm danger", type: "button", "aria-label": "Remove item " + (i + 1), onclick: function () {
     editor.items = editor.items.filter(function (x) { return x !== it; });
     if (editor.items.length === 0) editor.items.push(blank());
     rebuildItems(); updateBar();
   } }, icon("trash"), "Remove");
-  var card = h("div", { class: "card item" }, h("div", { class: "item-head" }, h("span", { class: "lbl", text: "Item " + (i + 1) }), del), fName, fDesc, h("div", { class: "row2" }, fLink, fQty));
+  var card = h("div", { class: "card item" }, h("div", { class: "item-head" }, h("span", { class: "lbl", text: "Item " + (i + 1) }), del), fName, fDesc, h("div", { class: "row2" }, fLink, fQty), h("div", { class: "row2" }, fPrice, h("div", null)), pv);
   function paint() {
     var n = it.name.trim(), d = it.description.trim(), l = it.link.trim();
     var touched = !!(n || d || l);
@@ -1096,10 +1154,11 @@ function itemCard(it, i) {
     var linkBad = l && normLink(l) === null && (editor.showErrors || it._lt);
     var qtyBad = touched && !parseQty(it).ok;
     errName.hidden = !nameBad; errDesc.hidden = !descBad; errLink.hidden = !linkBad; errQty.hidden = !qtyBad;
+    errPrice.hidden = it.price.trim().length <= 60;
     fName.classList.toggle("bad", !!nameBad); fDesc.classList.toggle("bad", !!descBad); fLink.classList.toggle("bad", !!linkBad); fQty.classList.toggle("bad", !!qtyBad);
   }
-  function changed() { paint(); updateBar(); }
-  paint();
+  function changed() { paint(); updateBar(); paintPv(); }
+  paint(); paintPv();
   return card;
 }
 function updateBar() {
@@ -1274,9 +1333,16 @@ function memberView(member) {
     }
     if (it.price) main.append(h("p", { class: "price" }, h("strong", { text: it.price }), it.price_as_of ? h("span", { class: "muted", text: " as of " + it.price_as_of }) : null));
     if (it.link) main.append(h("a", { class: "link", href: it.link, target: "_blank", rel: "noopener noreferrer" }, "View on " + host(it.link), icon("ext")));
-    wrap.append(h("div", { class: "card wish" + (isFull(it) ? " bought" : ""), "data-item": it.name }, main, claimSide(it)));
+    wrap.append(h("div", { class: "card wish" + (isFull(it) ? " bought" : ""), "data-item": it.name }, itemPhoto(it, "wish-img"), main, claimSide(it)));
   });
   return wrap;
+}
+
+function itemPhoto(it, cls) {
+  if (!it.image_url) return null;
+  var img = h("img", { class: cls, src: it.image_url, alt: it.name, loading: "lazy", referrerpolicy: "no-referrer", "data-photo": it.name });
+  img.addEventListener("error", function () { img.remove(); });
+  return img;
 }
 
 /* purchases summary */

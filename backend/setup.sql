@@ -124,6 +124,12 @@ create table if not exists public.wish_items (
   updated_at  timestamptz not null default now(),
   foreign key (group_id, owner) references public.group_members(group_id, member_id) on delete cascade
 );
+-- A photo of the item (an https address), filled in from the item's link when possible.
+alter table public.wish_items add column if not exists image_url text;
+do $$ begin
+  alter table public.wish_items add constraint wish_items_image_url_check
+    check (image_url is null or (image_url ~* '^https://' and length(image_url) <= 2000));
+exception when duplicate_object then null; end $$;
 create index if not exists wish_items_owner_idx on public.wish_items(group_id, owner, position);
 
 -- Who has picked up an item. An item with quantity > 1 can have several claimers.
