@@ -40,6 +40,7 @@ Everyone signs in with the same emails as before and finds Family Christmas on t
 - **Auto-archive:** a group archives itself the day after its event date (counted in the time zone stored in `app_settings`, default `America/Los_Angeles`; change it with `update public.app_settings set value = 'America/New_York' where key = 'timezone';`). To bring it back, the admin picks a new date on the Manage tab.
 - **Edit and remove (admin, Manage tab):** rename the group, move the event date, or remove a member. Removing someone deletes their list and everything they picked, and frees any items they had claimed. They can rejoin only with an invite link, so make a new link if you want the old one switched off. Archived groups can't be edited.
 - **Prices paid:** on any item you've picked you can enter what you paid. The Purchases tab totals it per list and across all lists. Only you can see your prices; not the list's owner, and not other shoppers.
+- **Tab order in a group:** until you've shared your own list, **My list** is the first tab and the page a group opens on, so it's the first thing you fill in. Once your list is shared, it moves to after **Purchases** and the group opens on **Everyone**. (Your list is still one click away, and Manage stays last.)
 - **Dashboard:** every group you are in, its created date, member count, and how many people you still have no purchase marked for.
 - **Emails:** when someone submits a list, the rest of that group is emailed. There are no reminder emails.
 

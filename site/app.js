@@ -366,7 +366,8 @@ async function openGroup(id, view) {
   try {
     await loadGroups();
     if (!groupInfo()) { route = { name: "dashboard" }; renderMain(); toast("That group isn’t available."); return; }
-    if (!view && isRegistry()) route.view = "members";
+    // Land on my list while it still needs filling out; once it's shared, start on everyone's lists.
+    if (!view) { var gi = groupInfo(); route.view = isRegistry() || (gi && gi.list_submitted) ? "members" : "my"; }
     await loadGroup();
   } catch (e) { toast(humanize(e)); route = { name: "dashboard" }; renderMain(); return; }
   ui.loadingGroup = false;
@@ -952,12 +953,13 @@ function groupShell() {
   ui.tabMy = reg ? null : h("button", { class: "tab", type: "button", role: "tab", id: "tab-my", onclick: function () { setView("my"); } });
   ui.tabFam = h("button", { class: "tab", type: "button", role: "tab", id: "tab-family", onclick: function () { setView("members"); } });
   ui.tabPur = h("button", { class: "tab", type: "button", role: "tab", id: "tab-purchases", onclick: function () { setView("purchases"); } });
-  var tabList = reg ? [ui.tabFam, ui.tabPur] : [ui.tabMy, ui.tabFam, ui.tabPur];
+  var tabList = reg ? [ui.tabFam, ui.tabPur] : g.list_submitted ? [ui.tabFam, ui.tabPur, ui.tabMy] : [ui.tabMy, ui.tabFam, ui.tabPur];
   if (g.is_admin) {
     ui.tabManage = h("button", { class: "tab", type: "button", role: "tab", id: "tab-manage", onclick: function () { setView("manage"); } }, "Manage");
     tabList.push(ui.tabManage);
   }
   var tabs = h("div", { class: "tabs", role: "tablist" }, tabList);
+  ui.tabsEl = tabs;
   ui.panel = h("div", { class: "panel", id: "panel" });
   var back = h("button", { class: "btn ghost back", type: "button", id: "back-dash", onclick: goDashboard }, icon("back"), "All groups");
   var root = h("div", { class: "panel" }, top, ui.confirmRow, back, tabs, ui.panel);
@@ -984,6 +986,11 @@ function updateTabs() {
   ui.tabPur.setAttribute("aria-selected", v === "purchases" ? "true" : "false");
   if (ui.tabManage) ui.tabManage.setAttribute("aria-selected", v === "manage" ? "true" : "false");
   if (ui.tabMy) {
+    // Once my list is shared it moves after Purchases; until then it stays first.
+    var shared = !!((gd.listMeta.get(myId) || {}).submitted_at);
+    var order = shared ? [ui.tabFam, ui.tabPur, ui.tabMy] : [ui.tabMy, ui.tabFam, ui.tabPur];
+    if (ui.tabManage) order.push(ui.tabManage);
+    if (ui.tabsEl && order.some(function (t, i) { return ui.tabsEl.children[i] !== t; })) ui.tabsEl.append.apply(ui.tabsEl, order);
     ui.tabMy.replaceChildren(document.createTextNode("My list"));
     var lm = gd.listMeta.get(myId);
     if (!(lm && lm.submitted_at) && !isArchived()) ui.tabMy.append(h("span", { class: "badge warn", text: "Draft" }));
