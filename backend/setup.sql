@@ -914,19 +914,54 @@ begin
     'daily', coalesce((select jsonb_agg(jsonb_build_object(
         'day', days.day, 'users', coalesce(u.n, 0), 'groups', coalesce(g.n, 0), 'lists', coalesce(l.n, 0)) order by days.day)
       from days left join u using (day) left join g using (day) left join l using (day)), '[]'::jsonb),
-    'lists', coalesce((select jsonb_agg(x order by x.started desc nulls last) from (
-        select gr.name as group_name, gr.kind, gr.event_date, gr.archived_at is not null as archived,
-               o.name as owner_name, m.is_recipient as for_someone_else, mb.name as managed_by,
-               (select count(*) from public.wish_items i where i.group_id = wl.group_id and i.owner = wl.owner) as items,
-               wl.submitted_at is not null as shared, f.started
+    'groups', coalesce((select jsonb_agg(x order by x.created_at desc) from (
+        select gr.id, gr.name, gr.kind, gr.event_date, gr.created_at, gr.archived_at is not null as archived,
+               cr.name as created_by,
+               (select count(*) from public.group_members m where m.group_id = gr.id and not m.is_recipient) as members,
+               (select count(*) from public.wish_lists wl where wl.group_id = gr.id) as lists,
+               (select count(*) from public.wish_items i where i.group_id = gr.id) as items
+          from public.groups gr
+          join public.profiles cr on cr.id = gr.admin_id
+         limit 1000) x), '[]'::jsonb)
+  ) into v_out;
+  return v_out;
+end
+$$;
+
+-- Read-only look inside one group for the owner: every list and its items. No emails, no
+-- purchases (only how many of an item have been picked), and nothing here can change data.
+create or replace function public.owner_group_view(p_group uuid)
+returns jsonb
+language plpgsql stable security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_out jsonb;
+begin
+  if not public.is_owner() then
+    raise exception 'Not allowed';
+  end if;
+  select jsonb_build_object(
+    'group', jsonb_build_object('id', gr.id, 'name', gr.name, 'kind', gr.kind, 'event_date', gr.event_date,
+              'created_at', gr.created_at, 'archived', gr.archived_at is not null, 'created_by', cr.name,
+              'members', (select count(*) from public.group_members m where m.group_id = gr.id and not m.is_recipient)),
+    'lists', coalesce((select jsonb_agg(l order by l.owner_name) from (
+        select o.name as owner_name, m.is_recipient as for_someone_else, mb.name as managed_by,
+               wl.submitted_at is not null as shared,
+               coalesce((select jsonb_agg(jsonb_build_object(
+                    'name', i.name, 'description', i.description, 'link', i.link, 'image_url', i.image_url,
+                    'price', i.price, 'quantity', i.quantity,
+                    'picked', (select count(*) from public.claims c where c.item_id = i.id)) order by i.position, i.created_at)
+                  from public.wish_items i where i.group_id = wl.group_id and i.owner = wl.owner), '[]'::jsonb) as items
           from public.wish_lists wl
-          join public.groups gr on gr.id = wl.group_id
           join public.group_members m on m.group_id = wl.group_id and m.member_id = wl.owner
           join public.profiles o on o.id = wl.owner
           left join public.profiles mb on mb.id = m.managed_by
-          left join firsts f on f.group_id = wl.group_id and f.owner = wl.owner
-         limit 1000) x), '[]'::jsonb)
-  ) into v_out;
+         where wl.group_id = gr.id) l), '[]'::jsonb))
+  into v_out
+  from public.groups gr join public.profiles cr on cr.id = gr.admin_id
+  where gr.id = p_group;
+  if v_out is null then raise exception 'That group does not exist'; end if;
   return v_out;
 end
 $$;
@@ -1148,7 +1183,7 @@ grant execute on function
   public.today_local(), public.sweep_archives(), public.edit_group(uuid, text, date), public.remove_member(uuid, uuid),
   public.can_edit_items(uuid, uuid), public.create_registry(text, date, text), public.add_list(uuid, text), public.rename_list(uuid, uuid, text),
   public.add_child_list(uuid, text), public.delete_child_list(uuid, uuid), public.announce_child_list(uuid, uuid),
-  public.is_owner(), public.owner_dashboard(int)
+  public.is_owner(), public.owner_dashboard(int), public.owner_group_view(uuid)
   to authenticated;
 grant execute on function public.preview_invite(text) to anon, authenticated;
 

@@ -779,6 +779,7 @@ function renderMain() {
   if (route.name === "new") root.append(newGroupView());
   else if (route.name === "new-wishlist") root.append(newWishlistView());
   else if (route.name === "admin" && isOwner) root.append(adminView());
+  else if (route.name === "admin-group" && isOwner) root.append(adminGroupView());
   else if (route.name === "join") root.append(joinView());
   else root.append(dashboardView());
   app.append(root);
@@ -898,25 +899,69 @@ function adminView() {
         h("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" }, h("strong", { text: c[1] }), h("span", { class: "muted", id: "sum-" + c[0], text: sum(c[0]) + " in " + adminDays + " days" })),
         barChart(d.daily, c[0], c[2], c[1])));
     });
-    var q = h("input", { type: "search", id: "admin-filter", placeholder: "Filter lists by person or group", autocomplete: "off", style: "margin:8px 0" });
-    var table = h("div", { id: "admin-lists" });
+    var q = h("input", { type: "search", id: "admin-filter", placeholder: "Filter groups by name or creator", autocomplete: "off", style: "margin:8px 0" });
+    var table = h("div", { id: "admin-groups" });
     function paint() {
       var f = q.value.trim().toLowerCase();
-      var rows = d.lists.filter(function (l) { return !f || (l.owner_name + " " + l.group_name).toLowerCase().indexOf(f) >= 0; });
-      table.replaceChildren(h("p", { class: "muted", text: rows.length + " of " + d.lists.length + " lists" }));
-      rows.forEach(function (l) {
-        table.append(h("div", { class: "card", "data-owner": l.owner_name, style: "padding:10px 12px;margin-bottom:8px" },
-          h("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" },
-            h("strong", { text: l.owner_name + (l.for_someone_else ? " (list made by " + (l.managed_by || "the admin") + ")" : "") }),
-            h("span", { class: "chip " + (l.shared ? "" : "grey"), text: l.shared ? "Shared" : "Not shared" })),
-          h("div", { class: "muted", style: "font-size:13px", text: l.group_name + " · " + (l.kind === "registry" ? "Wishlist" : "Group") + " · " + l.items + " item" + (l.items === 1 ? "" : "s") + " · event " + fmtDay(l.event_date) + (l.archived ? " · archived" : "") + (l.started ? " · started " + fmtDay(l.started) : "") })));
+      var rows = d.groups.filter(function (g) { return !f || (g.name + " " + g.created_by).toLowerCase().indexOf(f) >= 0; });
+      table.replaceChildren(h("p", { class: "muted", text: rows.length + " of " + d.groups.length + " groups" }));
+      rows.forEach(function (g) {
+        table.append(h("button", { class: "tag gcard", type: "button", "data-gid": g.id, style: "display:block;width:100%;text-align:left;margin-bottom:8px", "aria-label": "View " + g.name,
+          onclick: function () { route = { name: "admin-group", id: g.id }; renderMain(); window.scrollTo({ top: 0 }); } },
+          h("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center" },
+            h("h3", { text: g.name }),
+            h("span", { class: "chips" }, g.kind === "registry" ? h("span", { class: "chip", text: "Wishlist" }) : null, g.archived ? h("span", { class: "chip grey", text: "Archived" }) : null)),
+          h("dl", { class: "stats", style: "grid-template-columns:repeat(auto-fit,minmax(110px,1fr));margin-top:8px" },
+            h("div", null, h("dt", { text: "Members" }), h("dd", { class: "ag-members", text: String(g.members) })),
+            h("div", null, h("dt", { text: "Items" }), h("dd", { class: "ag-items", text: String(g.items) })),
+            h("div", null, h("dt", { text: "Event date" }), h("dd", { text: fmtDay(g.event_date) })),
+            h("div", null, h("dt", { text: "Created" }), h("dd", { text: fmtDay(g.created_at) })),
+            h("div", null, h("dt", { text: "Created by" }), h("dd", { text: g.created_by })))));
       });
     }
     q.addEventListener("input", paint);
-    body.append(h("h3", { text: "All lists", style: "margin-top:20px" }), q, table);
+    body.append(h("h3", { text: "All groups", style: "margin-top:20px" }), q, table);
     paint();
   }
   load();
+  return wrap;
+}
+
+/* owner-only, read-only look inside one group */
+function adminGroupView() {
+  var wrap = h("div", { class: "panel", id: "admin-group-view" });
+  var body = h("div");
+  var back = h("button", { class: "btn ghost", type: "button", id: "admin-group-back", onclick: function () { route = { name: "admin" }; renderMain(); }, text: "Back to Admin" });
+  wrap.append(body);
+  sb.rpc("owner_group_view", { p_group: route.id }).then(function (r) {
+    if (r.error) { body.replaceChildren(h("div", { class: "dash-head" }, h("div", { class: "page-head" }, h("h2", { text: "Group" })), back), h("p", { class: "err", role: "alert", text: "Couldn’t open that group." })); return; }
+    var g = r.data.group, lists = r.data.lists;
+    body.replaceChildren(
+      h("div", { class: "dash-head" },
+        h("div", { class: "page-head" }, h("h2", { id: "ag-title", text: g.name }),
+          h("p", { class: "muted", text: (g.kind === "registry" ? "Wishlist" : "Group") + " · " + g.members + " member" + (g.members === 1 ? "" : "s") + " · event " + fmtDay(g.event_date) + " · created " + fmtDay(g.created_at) + " by " + g.created_by + (g.archived ? " · archived" : "") })),
+        back),
+      h("div", { class: "card", id: "ag-banner", style: "padding:10px 12px;margin-bottom:12px" }, h("strong", { text: "Admin view, read only. " }), h("span", { class: "muted", text: "You can look at every list, but nothing here can be changed." })));
+    if (!lists.length) body.append(h("p", { class: "muted", text: "No lists in this group yet." }));
+    lists.forEach(function (l) {
+      var card = h("div", { class: "card", "data-owner": l.owner_name, style: "margin-bottom:12px" },
+        h("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" },
+          h("h3", { text: l.owner_name + (l.for_someone_else ? " (made by " + (l.managed_by || "the admin") + ")" : "") }),
+          h("span", { class: "chip " + (l.shared ? "" : "grey"), text: l.shared ? "Shared" : "Not shared" })));
+      if (!l.items.length) card.append(h("p", { class: "muted", text: "No items yet." }));
+      l.items.forEach(function (it) {
+        card.append(h("div", { class: "wish", "data-item": it.name, style: "display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--line)" },
+          itemPhoto(it, "wish-img"),
+          h("div", { style: "min-width:0;flex:1" },
+            h("strong", { text: it.name }),
+            h("div", { class: "muted", style: "font-size:14px", text: it.description }),
+            h("div", { class: "muted", style: "font-size:13px" },
+              [it.price, "qty " + qtyText(it.quantity), it.picked + " picked"].filter(Boolean).join(" · "),
+              it.link ? " · " : null, it.link ? h("a", { href: it.link, target: "_blank", rel: "noopener noreferrer", text: host(it.link) }) : null))));
+      });
+      body.append(card);
+    });
+  });
   return wrap;
 }
 
