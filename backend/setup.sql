@@ -74,9 +74,12 @@ alter table public.groups add column if not exists auto_archived boolean not nul
 -- 'group' = people who each make a list for each other. 'registry' = a one-way wishlist: the admin writes the
 -- lists (for kids, say) and everyone with the link can view them and pick gifts, but cannot make lists of their own.
 alter table public.groups add column if not exists kind text not null default 'group';
-do $$ begin
-  alter table public.groups add constraint groups_kind_check check (kind in ('group', 'registry'));
-exception when duplicate_object then null; end $$;
+-- 'secret_santa' = like a group, but nobody can read anyone else's list until the host draws names; then each
+-- player can read (and buy from) only the one list they were given.
+alter table public.groups drop constraint if exists groups_kind_check;
+alter table public.groups add constraint groups_kind_check check (kind in ('group', 'registry', 'secret_santa'));
+-- When the Secret Santa names were drawn (null until then). It cannot be undone.
+alter table public.groups add column if not exists draw_at timestamptz;
 
 -- The join link code. Only the group's admin can read it.
 create table if not exists public.group_invites (
@@ -109,6 +112,8 @@ create table if not exists public.wish_lists (
   foreign key (group_id, owner) references public.group_members(group_id, member_id) on delete cascade
 );
 alter table public.wish_lists add column if not exists notified_at timestamptz;
+-- When the group was last emailed that this (already shared) list changed. Used to avoid sending an email per edit.
+alter table public.wish_lists add column if not exists update_notified_at timestamptz;
 
 create table if not exists public.wish_items (
   id          uuid primary key default gen_random_uuid(),
@@ -166,6 +171,62 @@ create table if not exists public.claim_details (
   primary key (item_id, buyer),
   foreign key (item_id, buyer) references public.claims(item_id, buyer) on delete cascade
 );
+
+-- The Secret Santa draw: who buys for whom. Each player can read only their own row. The host cannot read
+-- these rows, so the host plays too without knowing who has whom.
+create table if not exists public.santa_assignments (
+  group_id   uuid not null,
+  giver      uuid not null,
+  receiver   uuid not null,
+  created_at timestamptz not null default now(),
+  primary key (group_id, giver),
+  unique (group_id, receiver),
+  check (giver <> receiver),
+  foreign key (group_id, giver)    references public.group_members(group_id, member_id) on delete cascade,
+  foreign key (group_id, receiver) references public.group_members(group_id, member_id) on delete cascade
+);
+
+-- Something a shopper bought for another member that is NOT on that person's list, with the same private
+-- management details as a normal purchase. Only the shopper can see these, never the person they are for.
+create table if not exists public.extra_purchases (
+  id           uuid primary key default gen_random_uuid(),
+  group_id     uuid not null,
+  buyer        uuid not null,
+  recipient    uuid not null,
+  name         text not null check (length(trim(name)) between 1 and 80),
+  link         text check (link is null or (link ~* '^https?://' and length(link) <= 2000)),
+  price        numeric(10, 2) check (price is null or (price >= 0 and price < 10000000)),
+  note         text check (note is null or length(note) <= 300),
+  tracking_url text check (tracking_url is null or (tracking_url ~* '^https?://' and length(tracking_url) <= 2000)),
+  arrived      boolean not null default false,
+  created_at   timestamptz not null default now(),
+  updated_at   timestamptz not null default now(),
+  check (buyer <> recipient),
+  foreign key (group_id, buyer)     references public.group_members(group_id, member_id) on delete cascade,
+  foreign key (group_id, recipient) references public.group_members(group_id, member_id) on delete cascade
+);
+create index if not exists extra_purchases_buyer_idx on public.extra_purchases(group_id, buyer);
+
+-- A short "about me" note at the top of a list (hobbies, interests, things not to buy). Up to 1000 characters.
+create table if not exists public.list_about (
+  group_id   uuid not null,
+  owner      uuid not null,
+  about      text not null check (char_length(about) between 1 and 1000),
+  updated_at timestamptz not null default now(),
+  primary key (group_id, owner),
+  foreign key (group_id, owner) references public.group_members(group_id, member_id) on delete cascade
+);
+
+-- Suggestions and bug reports. Nobody can read this table directly; the app owner reads it through owner_feedback().
+create table if not exists public.feedback (
+  id          uuid primary key default gen_random_uuid(),
+  author      uuid not null references public.profiles(id) on delete cascade,
+  kind        text not null check (kind in ('suggestion', 'bug')),
+  message     text not null check (char_length(message) between 1 and 1000),
+  created_at  timestamptz not null default now(),
+  resolved_at timestamptz
+);
+create index if not exists feedback_created_idx on public.feedback(created_at desc);
 
 -- ---------------------------------------------------------------------------
 -- Who is signed in, and what can they do?
@@ -274,6 +335,71 @@ as $$
     where a.member_id = public.my_id() and b.member_id = p_id)
 $$;
 
+-- Which lists can I read? My own (drafts too). In a group or wishlist: any submitted list. In a Secret Santa: only the
+-- one list I was given in the draw.
+create or replace function public.can_view_list(p_group uuid, p_owner uuid)
+returns boolean
+language sql stable security definer
+set search_path = public, pg_temp
+as $$
+  select public.is_member(p_group) and (
+    p_owner = public.my_id()
+    or case (select kind from public.groups where id = p_group)
+         when 'secret_santa' then exists (select 1 from public.santa_assignments a
+                                          where a.group_id = p_group and a.giver = public.my_id() and a.receiver = p_owner)
+                                  and public.list_submitted(p_group, p_owner)
+         else public.list_submitted(p_group, p_owner)
+       end)
+$$;
+
+-- Who can I record an outside-the-list purchase for? Any other member (a wishlist: its lists; a Secret Santa: only the
+-- person I was given).
+create or replace function public.can_shop_for(p_group uuid, p_recipient uuid)
+returns boolean
+language sql stable security definer
+set search_path = public, pg_temp
+as $$
+  select public.is_member(p_group) and p_recipient <> public.my_id()
+     and exists (select 1 from public.group_members m where m.group_id = p_group and m.member_id = p_recipient)
+     and case (select kind from public.groups where id = p_group)
+           when 'secret_santa' then exists (select 1 from public.santa_assignments a
+                                            where a.group_id = p_group and a.giver = public.my_id() and a.receiver = p_recipient)
+           when 'registry' then exists (select 1 from public.group_members m where m.group_id = p_group and m.member_id = p_recipient and m.is_recipient)
+           else true
+         end
+$$;
+
+create or replace function public.touch_updated_at()
+returns trigger
+language plpgsql
+as $$
+begin
+  new.updated_at := now();
+  return new;
+end
+$$;
+
+drop trigger if exists extra_purchases_touch on public.extra_purchases;
+create trigger extra_purchases_touch before update on public.extra_purchases
+  for each row execute function public.touch_updated_at();
+
+-- Keep one person from filling the table.
+create or replace function public.guard_extra_purchase()
+returns trigger
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if (select count(*) from public.extra_purchases where group_id = new.group_id and buyer = new.buyer) >= 200 then
+    raise exception 'You can track up to 200 extra purchases in one group';
+  end if;
+  return new;
+end
+$$;
+drop trigger if exists extra_purchases_guard on public.extra_purchases;
+create trigger extra_purchases_guard before insert on public.extra_purchases
+  for each row execute function public.guard_extra_purchase();
+
 -- ---------------------------------------------------------------------------
 -- Item rules
 -- ---------------------------------------------------------------------------
@@ -306,6 +432,7 @@ as $$
           p_owner = public.my_id()
           or exists (select 1 from public.group_members m
                      where m.group_id = p_group and m.member_id = p_owner and m.is_recipient and m.managed_by = public.my_id())))
+      or (g.kind = 'secret_santa' and public.is_member(p_group) and p_owner = public.my_id())
       or (g.kind = 'registry' and g.admin_id = public.my_id()
           and exists (select 1 from public.group_members m where m.group_id = p_group and m.member_id = p_owner and m.is_recipient))
     ))
@@ -319,7 +446,7 @@ set search_path = public, pg_temp
 as $$
 declare v_min int;
 begin
-  select item_min into v_min from public.groups where id = old.group_id and kind = 'group';
+  select item_min into v_min from public.groups where id = old.group_id and kind in ('group', 'secret_santa');
   if v_min is not null
      and public.list_submitted(old.group_id, old.owner)
      and not exists (select 1 from public.group_members m where m.group_id = old.group_id and m.member_id = old.owner and m.is_recipient)
@@ -430,12 +557,29 @@ as $$
 declare
   v_who   text;
   v_group text;
+  v_kind  text;
   v_n     int;
   v_to    text[];
 begin
   select name into v_who   from public.profiles where id = p_owner;
-  select name into v_group from public.groups   where id = p_group;
+  select name, kind into v_group, v_kind from public.groups where id = p_group;
   select count(*) into v_n from public.wish_items where group_id = p_group and owner = p_owner;
+  if v_kind = 'secret_santa' then
+    -- Nobody can read anyone else's list in a Secret Santa, so only the host hears about it.
+    select array_agg(p.email) into v_to
+      from public.groups g join public.profiles p on p.id = g.admin_id
+     where g.id = p_group and g.admin_id <> p_owner;
+    perform public.send_mail(
+      v_to,
+      coalesce(v_who, 'Someone') || ' shared a list in ' || coalesce(v_group, 'your Secret Santa'),
+      public.mail_html(
+        public.esc(coalesce(v_who, 'Someone')) || ' shared a list',
+        public.esc(coalesce(v_who, 'Someone')) || ' just submitted a list with ' || v_n || case when v_n = 1 then ' item' else ' items' end
+          || ' in ' || public.esc(coalesce(v_group, 'your Secret Santa')) || '. When everyone you need has shared, you can draw the names.',
+        'Open the Secret Santa')
+    );
+    return;
+  end if;
   select array_agg(p.email order by p.email) into v_to from public.group_members m join public.profiles p on p.id = m.member_id where m.group_id = p_group and m.member_id <> p_owner and not m.is_recipient;
   perform public.send_mail(
     v_to,
@@ -522,11 +666,12 @@ end
 $$;
 
 -- Everything the dashboard shows, one row per group you are in.
-drop function if exists public.my_groups();   -- its columns changed (added admin_name, kind)
+drop function if exists public.my_groups();   -- its columns changed (added admin_name, kind, drawn)
 create or replace function public.my_groups()
 returns table (
   group_id uuid, name text, event_date date, created_at timestamptz, archived_at timestamptz,
-  is_admin boolean, item_min int, member_count int, left_to_shop int, list_submitted boolean, admin_name text, kind text
+  is_admin boolean, item_min int, member_count int, left_to_shop int, list_submitted boolean, admin_name text, kind text,
+  drawn boolean
 )
 language sql stable security definer
 set search_path = public, pg_temp
@@ -534,15 +679,28 @@ as $$
   select g.id, g.name, g.event_date, g.created_at, g.archived_at,
          g.admin_id = public.my_id(), g.item_min,
          -- in a registry "members" counts the lists (the people the wishes are for)
-         (select count(*)::int from public.group_members x where x.group_id = g.id and ((g.kind = 'group') <> x.is_recipient)),
-         (select count(*)::int from public.group_members x
-           where x.group_id = g.id and x.member_id <> public.my_id() and (g.kind = 'group' or x.is_recipient)
-             and (not x.is_recipient or exists (select 1 from public.wish_items w where w.group_id = g.id and w.owner = x.member_id))
-             and not exists (select 1 from public.claims c join public.wish_items i on i.id = c.item_id
-                             where i.group_id = g.id and i.owner = x.member_id and c.buyer = public.my_id())),
+         (select count(*)::int from public.group_members x where x.group_id = g.id and ((g.kind <> 'registry') <> x.is_recipient)),
+         case when g.kind = 'secret_santa' then
+           -- one person to shop for, once the names are drawn
+           (select count(*)::int from public.santa_assignments a
+             where a.group_id = g.id and a.giver = public.my_id()
+               and not exists (select 1 from public.claims c join public.wish_items i on i.id = c.item_id
+                               where i.group_id = g.id and i.owner = a.receiver and c.buyer = public.my_id())
+               and not exists (select 1 from public.extra_purchases e
+                               where e.group_id = g.id and e.buyer = public.my_id() and e.recipient = a.receiver))
+         else
+           (select count(*)::int from public.group_members x
+             where x.group_id = g.id and x.member_id <> public.my_id() and (g.kind = 'group' or x.is_recipient)
+               and (not x.is_recipient or exists (select 1 from public.wish_items w where w.group_id = g.id and w.owner = x.member_id))
+               and not exists (select 1 from public.claims c join public.wish_items i on i.id = c.item_id
+                               where i.group_id = g.id and i.owner = x.member_id and c.buyer = public.my_id())
+               and not exists (select 1 from public.extra_purchases e
+                               where e.group_id = g.id and e.buyer = public.my_id() and e.recipient = x.member_id))
+         end,
          (g.kind = 'registry' or public.list_submitted(g.id, public.my_id())),
          (select p.name from public.profiles p where p.id = g.admin_id),
-         g.kind
+         g.kind,
+         g.draw_at is not null
   from public.groups g
   join public.group_members gm on gm.group_id = g.id and gm.member_id = public.my_id()
   order by (g.archived_at is not null), g.event_date, g.name
@@ -551,13 +709,13 @@ $$;
 -- What a join link points to. Safe to call before signing in; it reveals only the group's name and date.
 drop function if exists public.preview_invite(text);
 create or replace function public.preview_invite(p_code text)
-returns table (group_name text, event_date date, archived boolean, member_count int, kind text)
+returns table (group_name text, event_date date, archived boolean, member_count int, kind text, drawn boolean)
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
   select g.name, g.event_date, (g.archived_at is not null or g.event_date < public.today_local()),
-         (select count(*)::int from public.group_members x where x.group_id = g.id and ((g.kind = 'group') <> x.is_recipient)),
-         g.kind
+         (select count(*)::int from public.group_members x where x.group_id = g.id and ((g.kind <> 'registry') <> x.is_recipient)),
+         g.kind, g.draw_at is not null
   from public.group_invites i join public.groups g on g.id = i.group_id
   where i.code = p_code
 $$;
@@ -580,6 +738,9 @@ begin
   if g is null then raise exception 'This invite link is not valid any more'; end if;
   if exists (select 1 from public.group_members where group_id = g and member_id = m) then return g; end if;
   if ar is not null then raise exception 'This group is archived and closed to new members'; end if;
+  if exists (select 1 from public.groups where id = g and kind = 'secret_santa' and draw_at is not null) then
+    raise exception 'The names have already been drawn for this Secret Santa, so it is closed to new players';
+  end if;
   insert into public.group_members (group_id, member_id) values (g, m);
   return g;
 end
@@ -679,6 +840,9 @@ begin
   if not public.is_admin(p_group) then raise exception 'Only the group admin can do that'; end if;
   if not public.group_open(p_group) then raise exception 'This group is archived, so members can no longer be removed'; end if;
   if p_member = public.my_id() then raise exception 'You are the admin, so you can''t remove yourself'; end if;
+  if exists (select 1 from public.santa_assignments a where a.group_id = p_group and (a.giver = p_member or a.receiver = p_member)) then
+    raise exception 'The names have been drawn, so players in the draw can no longer be removed';
+  end if;
   if not exists (select 1 from public.group_members where group_id = p_group and member_id = p_member) then
     raise exception 'That person is not in this group';
   end if;
@@ -848,6 +1012,10 @@ begin
   end if;
 
   select item_min into v_min from public.groups where id = p_group;
+  if exists (select 1 from public.groups where id = p_group and kind = 'secret_santa' and draw_at is not null)
+     and not public.list_submitted(p_group, m) then
+    raise exception 'The names have already been drawn, so new lists can no longer be added';
+  end if;
   select count(*) into n from public.wish_items where group_id = p_group and owner = m;
   if n < v_min then
     raise exception 'Add at least % items before submitting', v_min;
@@ -864,6 +1032,209 @@ begin
   if coalesce(first_time, true) then
     perform public.notify_submitted(p_group, m);
   end if;
+end
+$$;
+
+-- Anyone can make a Secret Santa. The host is its admin.
+create or replace function public.create_secret_santa(p_name text, p_event date, p_min int)
+returns uuid
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare
+  m uuid := public.my_id();
+  g uuid;
+begin
+  if public.me() is null then raise exception 'Not authenticated'; end if;
+  if m is null then raise exception 'Add your name first'; end if;
+  if length(trim(coalesce(p_name, ''))) not between 1 and 60 then raise exception 'Enter a name up to 60 characters'; end if;
+  if p_event is null then raise exception 'Choose the event date'; end if;
+  if p_event < public.today_local() then raise exception 'The event date has already passed. Choose a date that is today or later'; end if;
+  if p_min is null or p_min not between 1 and 50 then raise exception 'The item minimum must be between 1 and 50'; end if;
+
+  insert into public.groups (name, event_date, item_min, admin_id, kind)
+  values (trim(p_name), p_event, p_min, m, 'secret_santa') returning id into g;
+  insert into public.group_members (group_id, member_id) values (g, m);
+  insert into public.group_invites (group_id, code) values (g, substr(replace(gen_random_uuid()::text, '-', ''), 1, 24));
+  return g;
+end
+$$;
+
+-- Host only, once, and it cannot be undone. Everyone who has shared a list is in the draw. Each of them is given exactly
+-- one other player's list at random, nobody gets their own, and every list is given to exactly one person. The host
+-- is told how many were drawn but never who has whom. Each player is emailed their own pick.
+create or replace function public.start_secret_santa(p_group uuid)
+returns int
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare
+  g        public.groups;
+  ids      uuid[];
+  n        int;
+  i        int;
+  v_to     text;
+  v_name   text;
+begin
+  if not public.is_admin(p_group) then raise exception 'Only the host can do that'; end if;
+  select * into g from public.groups where id = p_group for update;
+  if g.kind <> 'secret_santa' then raise exception 'That is not a Secret Santa'; end if;
+  if g.draw_at is not null then raise exception 'The names have already been drawn'; end if;
+  if not public.group_open(p_group) then raise exception 'This Secret Santa is archived, so the names can no longer be drawn'; end if;
+
+  select array_agg(m.member_id order by gen_random_uuid()) into ids
+    from public.group_members m
+   where m.group_id = p_group and not m.is_recipient and public.list_submitted(p_group, m.member_id);
+  n := coalesce(array_length(ids, 1), 0);
+  if n < 3 then raise exception 'At least 3 players need to share a list before the names can be drawn'; end if;
+
+  -- A random order, then each person gives to the next one in the circle: nobody gets their own list.
+  for i in 1 .. n loop
+    insert into public.santa_assignments (group_id, giver, receiver) values (p_group, ids[i], ids[i % n + 1]);
+  end loop;
+  update public.groups set draw_at = now() where id = p_group;
+
+  for i in 1 .. n loop
+    select p.email into v_to from public.profiles p where p.id = ids[i];
+    select p.name  into v_name from public.profiles p where p.id = ids[i % n + 1];
+    perform public.send_mail(
+      array[v_to],
+      'Your Secret Santa pick in ' || g.name,
+      public.mail_html(
+        'The names have been drawn',
+        'You are buying for <b>' || public.esc(v_name) || '</b> in ' || public.esc(g.name) || '. Open their list to see what they would love, and keep it a secret.',
+        'Open the Secret Santa')
+    );
+  end loop;
+  return n;
+end
+$$;
+
+-- Saves (or clears) the about-me note on a list. 1000 characters at most.
+create or replace function public.set_list_about(p_group uuid, p_owner uuid, p_about text)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare v text := trim(coalesce(p_about, ''));
+begin
+  if not public.can_edit_items(p_group, p_owner) then raise exception 'That list is not yours to change, or the group is archived'; end if;
+  if char_length(v) > 1000 then raise exception 'Keep this to 1000 characters or fewer'; end if;
+  if v = '' then
+    delete from public.list_about where group_id = p_group and owner = p_owner;
+  else
+    insert into public.list_about (group_id, owner, about) values (p_group, p_owner, v)
+    on conflict (group_id, owner) do update set about = excluded.about, updated_at = now();
+  end if;
+end
+$$;
+
+-- Called after someone saves changes to a list that is already shared. Emails the people who can see that list (at most
+-- once every 30 minutes per list, so a string of small edits is one email). Returns true when an email went out.
+--   group / wishlist: everyone except the person who made the change
+--   Secret Santa:     only the player who was given that list, and only after the draw
+create or replace function public.announce_list_update(p_group uuid, p_owner uuid, p_added int, p_changed int, p_removed int, p_about boolean)
+returns boolean
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare
+  m        uuid := public.my_id();
+  g        public.groups;
+  v_for    text; v_actor text;
+  v_to     text[];
+  a int := least(greatest(coalesce(p_added, 0), 0), 1000);
+  c int := least(greatest(coalesce(p_changed, 0), 0), 1000);
+  r int := least(greatest(coalesce(p_removed, 0), 0), 1000);
+  v_bits   text[] := '{}';
+  v_what   text;
+  v_tag    text;
+begin
+  if m is null or not public.can_edit_items(p_group, p_owner) then raise exception 'That list is not yours to change'; end if;
+  if not public.list_submitted(p_group, p_owner) then return false; end if;
+  if a + c + r = 0 and not coalesce(p_about, false) then return false; end if;
+
+  select * into g from public.groups where id = p_group;
+  select name into v_for   from public.profiles where id = p_owner;
+  select name into v_actor from public.profiles where id = m;
+  if g.kind = 'secret_santa' then
+    select array_agg(p.email) into v_to from public.santa_assignments sa join public.profiles p on p.id = sa.giver
+     where sa.group_id = p_group and sa.receiver = p_owner;
+  else
+    select array_agg(p.email order by p.email) into v_to
+      from public.group_members x join public.profiles p on p.id = x.member_id
+     where x.group_id = p_group and x.member_id <> m and not x.is_recipient;
+  end if;
+  if coalesce(array_length(v_to, 1), 0) = 0 then return false; end if;   -- nobody to tell (and the 30 minutes aren't used up)
+
+  update public.wish_lists set update_notified_at = now()
+   where group_id = p_group and owner = p_owner
+     and (update_notified_at is null or update_notified_at < now() - interval '30 minutes');
+  if not found then return false; end if;
+  if a > 0 then v_bits := v_bits || (a || ' added')::text; end if;
+  if c > 0 then v_bits := v_bits || (c || ' changed')::text; end if;
+  if r > 0 then v_bits := v_bits || (r || ' removed')::text; end if;
+  if coalesce(p_about, false) then v_bits := v_bits || 'the about note updated'::text; end if;
+  v_what := array_to_string(v_bits, ', ');
+  v_tag := case when p_owner = m then public.esc(coalesce(v_actor, 'Someone')) || ' updated their list'
+                else public.esc(coalesce(v_actor, 'Someone')) || ' updated the list for ' || public.esc(coalesce(v_for, 'someone')) end;
+  perform public.send_mail(
+    v_to,
+    case when p_owner = m then coalesce(v_actor, 'Someone') || ' updated their wishlist in ' || g.name
+         else coalesce(v_actor, 'Someone') || ' updated the wishlist for ' || coalesce(v_for, 'someone') || ' in ' || g.name end,
+    public.mail_html(
+      v_tag,
+      v_tag || ' in ' || public.esc(g.name) || ' (' || public.esc(v_what) || '). Open it to see what changed.',
+      'Open the wishlist')
+  );
+  return true;
+end
+$$;
+
+-- Suggestions and bug reports from signed-in people.
+create or replace function public.submit_feedback(p_kind text, p_message text)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare m uuid := public.my_id(); v text := trim(coalesce(p_message, ''));
+begin
+  if m is null then raise exception 'Not authenticated'; end if;
+  if p_kind not in ('suggestion', 'bug') then raise exception 'Choose suggestion or bug'; end if;
+  if char_length(v) = 0 then raise exception 'Write a few words first'; end if;
+  if char_length(v) > 1000 then raise exception 'Keep it to 1000 characters or fewer'; end if;
+  if (select count(*) from public.feedback where author = m and created_at > now() - interval '1 day') >= 10 then
+    raise exception 'You have sent a lot of feedback today. Please try again tomorrow';
+  end if;
+  insert into public.feedback (author, kind, message) values (m, p_kind, v);
+end
+$$;
+
+-- Owner only: every piece of feedback, open ones first.
+create or replace function public.owner_feedback()
+returns jsonb
+language plpgsql stable security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.is_owner() then raise exception 'Not allowed'; end if;
+  return coalesce((select jsonb_agg(x order by (x->>'resolved_at') is not null, x->>'created_at' desc) from (
+    select jsonb_build_object('id', f.id, 'kind', f.kind, 'message', f.message, 'created_at', f.created_at,
+                              'resolved_at', f.resolved_at, 'author_name', p.name, 'author_email', p.email) as x
+      from public.feedback f left join public.profiles p on p.id = f.author
+     order by f.created_at desc limit 500) q), '[]'::jsonb);
+end
+$$;
+
+create or replace function public.owner_set_feedback(p_id uuid, p_resolved boolean)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+begin
+  if not public.is_owner() then raise exception 'Not allowed'; end if;
+  update public.feedback set resolved_at = case when p_resolved then coalesce(resolved_at, now()) else null end where id = p_id;
+  if not found then raise exception 'That feedback no longer exists'; end if;
 end
 $$;
 
@@ -907,6 +1278,8 @@ begin
       'users',      (select count(*) from public.profiles where email not like '%@lists.invalid'),
       'groups',     (select count(*) from public.groups where kind = 'group'),
       'wishlists',  (select count(*) from public.groups where kind = 'registry'),
+      'santas',     (select count(*) from public.groups where kind = 'secret_santa'),
+      'open_feedback', (select count(*) from public.feedback where resolved_at is null),
       'lists',      (select count(*) from firsts),
       'lists_shared', (select count(*) from public.wish_lists where submitted_at is not null),
       'items',      (select count(*) from public.wish_items),
@@ -941,18 +1314,22 @@ begin
   if not public.is_owner() then
     raise exception 'Not allowed';
   end if;
+  -- In a Secret Santa the lists are private, so only who is in it and who has shared is shown, never the items.
   select jsonb_build_object(
     'group', jsonb_build_object('id', gr.id, 'name', gr.name, 'kind', gr.kind, 'event_date', gr.event_date,
               'created_at', gr.created_at, 'archived', gr.archived_at is not null, 'created_by', cr.name,
+              'drawn', gr.draw_at is not null,
               'members', (select count(*) from public.group_members m where m.group_id = gr.id and not m.is_recipient)),
     'lists', coalesce((select jsonb_agg(l order by l.owner_name) from (
         select o.name as owner_name, m.is_recipient as for_someone_else, mb.name as managed_by,
                wl.submitted_at is not null as shared,
-               coalesce((select jsonb_agg(jsonb_build_object(
+               (select count(*) from public.wish_items i where i.group_id = wl.group_id and i.owner = wl.owner) as item_count,
+               case when gr.kind = 'secret_santa' then '[]'::jsonb else coalesce((select jsonb_agg(jsonb_build_object(
                     'name', i.name, 'description', i.description, 'link', i.link, 'image_url', i.image_url,
                     'price', i.price, 'quantity', i.quantity,
                     'picked', (select count(*) from public.claims c where c.item_id = i.id)) order by i.position, i.created_at)
-                  from public.wish_items i where i.group_id = wl.group_id and i.owner = wl.owner), '[]'::jsonb) as items
+                  from public.wish_items i where i.group_id = wl.group_id and i.owner = wl.owner), '[]'::jsonb) end as items,
+               (select la.about from public.list_about la where la.group_id = wl.group_id and la.owner = wl.owner and gr.kind <> 'secret_santa') as about
           from public.wish_lists wl
           join public.group_members m on m.group_id = wl.group_id and m.member_id = wl.owner
           join public.profiles o on o.id = wl.owner
@@ -1004,7 +1381,7 @@ create policy lists_read on public.wish_lists
 drop policy if exists items_read on public.wish_items;
 create policy items_read on public.wish_items
   for select to authenticated
-  using (public.is_member(group_id) and (owner = public.my_id() or public.list_submitted(group_id, owner)));
+  using (public.can_view_list(group_id, owner));
 
 -- Adding and editing items stops when the group is archived.
 drop policy if exists items_insert on public.wish_items;
@@ -1027,17 +1404,17 @@ create policy items_delete on public.wish_items
 drop policy if exists claims_read on public.claims;
 create policy claims_read on public.claims
   for select to authenticated
-  using (public.is_member(public.item_group(item_id)) and public.wish_owner(item_id) <> public.my_id());
+  using (public.wish_owner(item_id) <> public.my_id()
+         and public.can_view_list(public.item_group(item_id), public.wish_owner(item_id)));
 
 drop policy if exists claims_insert on public.claims;
 create policy claims_insert on public.claims
   for insert to authenticated
   with check (
     buyer = public.my_id()
-    and public.is_member(public.item_group(item_id))
     and public.group_open(public.item_group(item_id))
     and public.wish_owner(item_id) <> public.my_id()
-    and public.list_submitted(public.item_group(item_id), public.wish_owner(item_id))
+    and public.can_view_list(public.item_group(item_id), public.wish_owner(item_id))
   );
 
 drop policy if exists claims_delete on public.claims;
@@ -1064,6 +1441,39 @@ drop policy if exists prices_delete on public.claim_prices;
 create policy prices_delete on public.claim_prices
   for delete to authenticated
   using (buyer = public.my_id() and public.group_open(public.item_group(item_id)));
+
+-- Secret Santa: each person can read only their own row (who they are buying for). Nobody can write directly.
+alter table public.santa_assignments enable row level security;
+drop policy if exists santa_read on public.santa_assignments;
+create policy santa_read on public.santa_assignments
+  for select to authenticated using (giver = public.my_id());
+
+-- Purchases outside someone's list: private to the shopper.
+alter table public.extra_purchases enable row level security;
+drop policy if exists extra_read on public.extra_purchases;
+create policy extra_read on public.extra_purchases
+  for select to authenticated using (buyer = public.my_id());
+drop policy if exists extra_insert on public.extra_purchases;
+create policy extra_insert on public.extra_purchases
+  for insert to authenticated
+  with check (buyer = public.my_id() and public.group_open(group_id) and public.can_shop_for(group_id, recipient));
+drop policy if exists extra_update on public.extra_purchases;
+create policy extra_update on public.extra_purchases
+  for update to authenticated
+  using (buyer = public.my_id() and public.group_open(group_id))
+  with check (buyer = public.my_id() and public.group_open(group_id) and public.can_shop_for(group_id, recipient));
+drop policy if exists extra_delete on public.extra_purchases;
+create policy extra_delete on public.extra_purchases
+  for delete to authenticated using (buyer = public.my_id() and public.group_open(group_id));
+
+-- About-me notes are readable by exactly the people who can read that list. Written through set_list_about().
+alter table public.list_about enable row level security;
+drop policy if exists about_read on public.list_about;
+create policy about_read on public.list_about
+  for select to authenticated using (public.can_view_list(group_id, owner));
+
+-- Feedback has no policies on purpose: only the functions above can touch it.
+alter table public.feedback enable row level security;
 
 -- Notes, tracking links and arrival: same rules as prices.
 alter table public.claim_details enable row level security;
@@ -1173,6 +1583,8 @@ grant select, insert, update, delete on public.wish_items to authenticated;
 grant select, insert, delete on public.claims to authenticated;
 grant select, insert, update, delete on public.claim_prices to authenticated;
 grant select, insert, update, delete on public.claim_details to authenticated;
+grant select on public.santa_assignments, public.list_about to authenticated;
+grant select, insert, update, delete on public.extra_purchases to authenticated;
 
 revoke all on all functions in schema public from public, anon, authenticated;
 grant execute on function
@@ -1183,7 +1595,10 @@ grant execute on function
   public.today_local(), public.sweep_archives(), public.edit_group(uuid, text, date), public.remove_member(uuid, uuid),
   public.can_edit_items(uuid, uuid), public.create_registry(text, date, text), public.add_list(uuid, text), public.rename_list(uuid, uuid, text),
   public.add_child_list(uuid, text), public.delete_child_list(uuid, uuid), public.announce_child_list(uuid, uuid),
-  public.is_owner(), public.owner_dashboard(int), public.owner_group_view(uuid)
+  public.is_owner(), public.owner_dashboard(int), public.owner_group_view(uuid),
+  public.can_view_list(uuid, uuid), public.can_shop_for(uuid, uuid), public.create_secret_santa(text, date, int), public.start_secret_santa(uuid),
+  public.set_list_about(uuid, uuid, text), public.announce_list_update(uuid, uuid, int, int, int, boolean),
+  public.submit_feedback(text, text), public.owner_feedback(), public.owner_set_feedback(uuid, boolean)
   to authenticated;
 grant execute on function public.preview_invite(text) to anon, authenticated;
 

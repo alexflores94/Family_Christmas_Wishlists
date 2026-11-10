@@ -143,6 +143,8 @@ function canManageList(m) {
 function editingOwner() { return route.view && route.view.indexOf("edit:") === 0 ? route.view.slice(5) : myId; }
 function isArchived() { var g = groupInfo(); return !!(g && g.archived_at); }
 function isAdmin() { var g = groupInfo(); return !!(g && g.is_admin); }
+function isSanta() { var g = groupInfo(); return !!(g && g.kind === "secret_santa"); }
+function isDrawn() { var g = groupInfo(); return !!(g && g.drawn); }
 function isRegistry() { var g = groupInfo(); return !!(g && g.kind === "registry"); }   // a one-way wishlist
 
 async function loadGroups() {
@@ -164,9 +166,13 @@ async function loadGroup() {
     sb.from("claims").select("item_id,buyer"),
     sb.from("claim_prices").select("item_id,amount"),
     isAdmin() ? sb.from("group_invites").select("code").eq("group_id", id) : Promise.resolve({ data: [] }),
-    sb.from("claim_details").select("item_id,note,tracking_url,arrived")
+    sb.from("claim_details").select("item_id,note,tracking_url,arrived"),
+    sb.from("list_about").select("owner,about").eq("group_id", id),
+    sb.from("extra_purchases").select("id,recipient,name,link,price,note,tracking_url,arrived,created_at").eq("group_id", id).order("created_at"),
+    sb.from("santa_assignments").select("receiver").eq("group_id", id)
   ]);
-  for (var i = 0; i < res.length; i++) if (res[i].error) throw res[i].error;
+  // the newer tables may not exist until setup.sql has been re-run: treat them as empty rather than failing
+  for (var i = 0; i < 8; i++) if (res[i].error) throw res[i].error;
   var names = new Map((res[1].data || []).map(function (p) { return [p.id, p.name]; }));
   var byName = function (a, b) { return (names.get(a) || a).localeCompare(names.get(b) || b); };
   var allIds = (res[0].data || []).map(function (m) { return m.member_id; }).sort(byName);
@@ -194,11 +200,14 @@ async function loadGroup() {
       return [r.item_id, { note: r.note || "", tracking_url: r.tracking_url || "", arrived: !!r.arrived }];
     })),
     listMeta: new Map((res[2].data || []).map(function (r) { return [r.owner, r]; })),
+    extras: (res[9].data || []).map(function (x) { return { id: x.id, recipient: x.recipient, name: x.name, link: x.link || "", price: x.price === null ? null : Number(x.price), note: x.note || "", tracking_url: x.tracking_url || "", arrived: !!x.arrived }; }),
+    assigned: (res[10].data && res[10].data[0] && res[10].data[0].receiver) || null,
+    about: new Map((res[8].data || []).map(function (r) { return [r.owner, r.about || ""]; })),
     items: items, claimers: claimers,
     code: (res[6].data && res[6].data[0] && res[6].data[0].code) || "",
     paid: new Map((res[5].data || []).filter(function (r) { return known.has(r.item_id); }).map(function (r) { return [r.item_id, Number(r.amount)]; }))
   };
-  var s = JSON.stringify([memberIds, allIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code, Array.from(next.paid), Array.from(next.details), Array.from(next.managedBy)]);
+  var s = JSON.stringify([memberIds, allIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code, Array.from(next.paid), Array.from(next.details), Array.from(next.managedBy), Array.from(next.about), next.extras, next.assigned]);
   var changed = s !== lastDataSig;
   lastDataSig = s;
   gd = next;
@@ -414,18 +423,48 @@ function initEditor(owner) {
   });
   while (!submitted && items.length < startBlanks()) items.push(blank());
   if (items.length === 0) items.push(blank());
-  editor = { owner: owner, registry: reg, items: items, submitted: submitted, saving: false, showErrors: false, baseSig: "" };
+  var about = (gd && gd.about.get(owner)) || "";
+  editor = { owner: owner, registry: reg, items: items, submitted: submitted, saving: false, showErrors: false, baseSig: "", about: about, aboutBase: about };
   editor.baseSig = sig(cleanItems().complete);
 }
+function aboutDirty() { return !!editor && (editor.about || "").trim() !== (editor.aboutBase || "").trim(); }
 function editorDirty() {
   if (!editor || route.name !== "group") return false;
   var r = cleanItems();
-  return sig(r.complete) !== editor.baseSig || r.problems > 0;
+  return sig(r.complete) !== editor.baseSig || r.problems > 0 || aboutDirty();
 }
 window.addEventListener("beforeunload", function (e) {
   if (phase === "ready" && editorDirty()) { e.preventDefault(); e.returnValue = ""; }
 });
 
+// How a save changes the list: items added, items edited, items removed. Used for the "list updated" email.
+function diffCounts(complete) {
+  var server = (gd.items.get(editor.owner)) || [];
+  var byId = new Map(server.map(function (i) { return [i.id, i]; }));
+  var keep = new Set(complete.filter(function (c) { return c.id; }).map(function (c) { return c.id; }));
+  var added = 0, changed = 0, removed = 0;
+  complete.forEach(function (c) {
+    if (!c.id) { added++; return; }
+    var o = byId.get(c.id);
+    if (o && (o.name !== c.name || o.description !== c.description || (o.link || "") !== (c.link || "") || o.quantity !== c.quantity || (o.price || "") !== (c.price || "") || (o.image_url || "") !== (c.image || ""))) changed++;
+  });
+  server.forEach(function (i) { if (!keep.has(i.id)) removed++; });
+  return { added: added, changed: changed, removed: removed, before: server.length };
+}
+async function persistAbout() {
+  if (!aboutDirty()) return false;
+  await api(sb.rpc("set_list_about", { p_group: route.id, p_owner: editor.owner, p_about: (editor.about || "").trim() }));
+  editor.about = (editor.about || "").trim(); editor.aboutBase = editor.about;
+  return true;
+}
+// Tell the people who can see this list that it changed (the database sends at most one email per 30 minutes).
+async function announceUpdate(diff, aboutChanged) {
+  if (!diff.before) return false;     // the first time items are added is announced by the share / new-list emails instead
+  if (!diff.added && !diff.changed && !diff.removed && !aboutChanged) return false;
+  try {
+    return (await api(sb.rpc("announce_list_update", { p_group: route.id, p_owner: editor.owner, p_added: diff.added, p_changed: diff.changed, p_removed: diff.removed, p_about: !!aboutChanged }))) === true;
+  } catch (e) { return false; }
+}
 async function persistItems(complete) {
   var server = (gd.items.get(editor.owner)) || [];
   var keep = new Set(complete.filter(function (c) { return c.id; }).map(function (c) { return c.id; }));
@@ -464,6 +503,7 @@ async function afterSave() {
   while (!editor.submitted && editor.items.length < startBlanks()) editor.items.push(blank());
   if (editor.items.length === 0) editor.items.push(blank());
   editor.baseSig = sig(cleanItems().complete);
+  editor.aboutBase = editor.about;
 }
 async function saveDraft() {
   var r = cleanItems();
@@ -472,6 +512,7 @@ async function saveDraft() {
   editor.saving = true; updateBar();
   try {
     await persistItems(r.complete);
+    await persistAbout();
     await afterSave();
     toast(r.problems ? "Draft saved. " + r.problems + (r.problems === 1 ? " unfinished item was" : " unfinished items were") + " left out." : "Draft saved. Nobody else can see it yet.");
   } catch (e) { toast(humanize(e)); }
@@ -483,19 +524,26 @@ async function submitList() {
   editor.showErrors = true;
   if (r.problems > 0 || (!editor.registry && r.complete.length < minItems())) { rebuildItems(); updateBar(); return; }
   var first = !editor.submitted;
+  var diff = diffCounts(r.complete), aboutChanged = aboutDirty();
   editor.saving = true; updateBar();
   try {
     await persistItems(r.complete);
+    await persistAbout();
     if (first) await api(sb.rpc("submit_list", { p_group: route.id }));
     // A list made for someone else: the first time it has items, the rest of the group is emailed once.
-    var announced = false;
+    var announced = false, told = false;
     if (editor.owner !== myId && !isRegistry() && r.complete.length) {
       try { announced = (await api(sb.rpc("announce_child_list", { p_group: route.id, p_member: editor.owner }))) === true; } catch (e) { announced = false; }
     }
+    if (!first && !announced) told = await announceUpdate(diff, aboutChanged);
     editor.showErrors = false;
     await afterSave();
     await loadGroups();
-    toast(first ? "Your list is live. The group has been emailed." : announced ? "Saved. The group has been emailed about " + possessive(editor.owner) + " list." : "Changes saved.");
+    var santa = isSanta();
+    toast(first ? (santa ? "Your list is shared. The host has been emailed." : "Your list is live. The group has been emailed.")
+      : announced ? "Saved. The group has been emailed about " + possessive(editor.owner) + " list."
+      : told ? (santa ? "Changes saved. Your Secret Santa has been told." : "Changes saved. The group has been emailed.")
+      : "Changes saved.");
   } catch (e) { toast(humanize(e)); }
   editor.saving = false;
   renderPanel(); updateTabs();
@@ -666,6 +714,7 @@ function topBar(eyebrow, countdown, title) {
     avatar(myId, "sm"), h("span", { class: "nm", text: myName || "Me" }));
   ui.confirmRow = h("div", { class: "confirm", hidden: true },
     h("span", { text: "Signed in as " + ((session && session.user && session.user.email) || myEmail || "you") + "." }),
+    h("button", { class: "btn sm", type: "button", id: "send-feedback", onclick: openFeedback, text: "Send feedback" }),
     h("button", { class: "btn sm primary", type: "button", id: "sign-out", onclick: signOut, text: "Sign out" }),
     h("button", { class: "btn sm ghost", type: "button", onclick: function () { ui.confirmRow.hidden = true; }, text: "Close" }));
   var top = h("div", { class: "top" },
@@ -826,14 +875,53 @@ function nameView() {
 }
 
 /* the signed-in shell */
+var feedbackBack = null;
+function openFeedback() { feedbackBack = route; route = { name: "feedback" }; renderMain(); window.scrollTo({ top: 0 }); }
+function closeFeedback() { route = feedbackBack || { name: "dashboard" }; feedbackBack = null; renderMain(); }
+function feedbackView() {
+  var kind = "suggestion";
+  var err = h("p", { class: "err", hidden: true, role: "alert", id: "fb-err" });
+  var count = h("span", { class: "muted", id: "fb-count", style: "font-size:13px" });
+  var box = h("textarea", { id: "fb-text", rows: "6", maxlength: "1000", "aria-describedby": "fb-count", placeholder: "Tell us what would make Wish Orbit better, or what went wrong and what you were doing when it happened." });
+  function paint() { count.textContent = box.value.length + " / 1000"; }
+  box.addEventListener("input", paint); paint();
+  var btn = h("button", { class: "btn primary", type: "submit", id: "fb-send", text: "Send feedback" });
+  function radio(v, label) {
+    return h("label", { class: "chk" }, h("input", { type: "radio", name: "fb-kind", value: v, id: "fb-" + v, checked: v === kind ? true : null, onchange: function () { kind = v; } }), label);
+  }
+  var form = h("form", { class: "card item", id: "fb-form", novalidate: true },
+    h("div", { class: "page-head" }, h("h2", { text: "Send feedback" }), h("p", { class: "muted", text: "Suggest an improvement or report a bug. The app’s owner reads every note." })),
+    h("div", { class: "field", role: "radiogroup", "aria-label": "Type of feedback" }, radio("suggestion", "A suggestion"), radio("bug", "A bug or problem")),
+    h("div", { class: "field" }, h("div", { style: "display:flex;justify-content:space-between" }, h("label", { for: "fb-text", text: "Your message" }), count), box),
+    err,
+    h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, btn, h("button", { class: "btn ghost", type: "button", id: "fb-cancel", onclick: closeFeedback, text: "Cancel" })));
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var msg = box.value.trim();
+    if (!msg) { err.textContent = "Write a few words first."; err.hidden = false; return; }
+    err.hidden = true; btn.disabled = true; btn.textContent = "Sending…";
+    try {
+      await api(sb.rpc("submit_feedback", { p_kind: kind, p_message: msg }));
+      closeFeedback();
+      toast("Thank you. Your feedback was sent.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = "Send feedback"; }
+  });
+  setTimeout(function () { box.focus(); }, 0);
+  return h("div", { class: "panel" }, form);
+}
 function renderMain() {
   app.replaceChildren();
   ui = {};
   if (phase !== "ready") return;
+  if (route.name === "feedback") {
+    var fr = h("div", { class: "panel" }, topBar("Gifts, together", null));
+    fr.append(ui.confirmRow, feedbackView()); app.append(fr); return;
+  }
   if (route.name === "group") { app.append(groupShell()); return; }
   var root = h("div", { class: "panel" }, topBar("Gifts, together", null));
   root.append(ui.confirmRow);
   if (route.name === "new") root.append(newGroupView());
+  else if (route.name === "new-santa") root.append(newGroupView("secret_santa"));
   else if (route.name === "new-orbit") root.append(newOrbitView());
   else if (route.name === "new-wishlist") root.append(newWishlistView());
   else if (route.name === "admin" && isOwner) root.append(adminView());
@@ -872,10 +960,12 @@ function dashboardView() {
   var grid = h("div", { class: "grid" });
   showing.forEach(function (g) {
     var d = daysUntil(g.event_date);
-    var left = g.kind !== "registry" && g.member_count <= 1 ? "Just you so far" : g.left_to_shop === 0 ? "All shopped for" : g.left_to_shop + " to go";
+    var left = g.kind === "secret_santa" ? (!g.drawn ? "Names not drawn yet" : g.left_to_shop === 0 ? "Gift bought" : "Gift to buy")
+      : g.kind !== "registry" && g.member_count <= 1 ? "Just you so far" : g.left_to_shop === 0 ? "All shopped for" : g.left_to_shop + " to go";
     var chips = h("div", { class: "chips" });
     var isReg = g.kind === "registry";
     if (isReg) chips.append(h("span", { class: "chip", "data-chip": "wishlist", text: "Wishlist" }));
+    if (g.kind === "secret_santa") chips.append(h("span", { class: "chip", "data-chip": "santa", text: "Secret Santa" }));
     if (g.is_admin) chips.append(h("span", { class: "chip gold", text: "Admin" }));
     if (g.archived_at) chips.append(h("span", { class: "chip grey", text: "Archived" }));
     else if (!isReg && !g.list_submitted) chips.append(h("span", { class: "chip red", text: "Your list isn’t shared" }));
@@ -886,8 +976,8 @@ function dashboardView() {
         h("div", null, h("dt", { text: "Event date" }), h("dd", { class: "s-event" }, fmtDay(g.event_date), g.archived_at ? null : h("span", { class: "muted", style: "display:block;font-weight:400;font-size:13px", text: d > 1 ? "in " + d + " days" : d === 1 ? "tomorrow" : d === 0 ? "today" : "passed" }))),
         h("div", null, h("dt", { text: "Created by" }), h("dd", { class: "s-creator", text: g.admin_name || "—" })),
         h("div", null, h("dt", { text: "Created" }), h("dd", { class: "s-created", text: fmtDay(g.created_at) })),
-        h("div", null, h("dt", { text: isReg ? "Lists" : "Members" }), h("dd", { class: "s-members", text: String(g.member_count) })),
-        h("div", null, h("dt", { text: "Left to shop for" }), h("dd", { class: "s-left", text: left })))));
+        h("div", null, h("dt", { text: isReg ? "Lists" : g.kind === "secret_santa" ? "Players" : "Members" }), h("dd", { class: "s-members", text: String(g.member_count) })),
+        h("div", null, h("dt", { text: g.kind === "secret_santa" ? "Your pick" : "Left to shop for" }), h("dd", { class: "s-left", text: left })))));
   });
   wrap.append(grid);
   return wrap;
@@ -923,6 +1013,52 @@ function barChart(rows, key, color, label) {
   });
   return svg;
 }
+/* owner-only: the feedback people have sent, with who and when, and a way to mark it resolved */
+function feedbackLog() {
+  var card = h("div", { class: "card stack", id: "feedback-log", style: "margin-top:16px" });
+  var list = h("div", { id: "feedback-list" });
+  var showResolved = false, rows = [];
+  var toggle = h("button", { class: "btn sm ghost", type: "button", id: "fb-toggle" });
+  function when(t) { return new Date(t).toLocaleString(undefined, { dateStyle: "medium", timeStyle: "short" }); }
+  function paint() {
+    var open = rows.filter(function (r) { return !r.resolved_at; }), done = rows.filter(function (r) { return !!r.resolved_at; });
+    toggle.textContent = showResolved ? "Hide resolved (" + done.length + ")" : "Show resolved (" + done.length + ")";
+    toggle.hidden = !done.length;
+    var show = showResolved ? open.concat(done) : open;
+    list.replaceChildren();
+    if (!show.length) list.append(h("p", { class: "muted", id: "fb-empty", text: rows.length ? "Nothing open. Nice." : "No feedback yet." }));
+    show.forEach(function (r) {
+      var resolved = !!r.resolved_at;
+      var btn = h("button", { class: "btn sm" + (resolved ? " ghost" : ""), type: "button", "data-fb-toggle": r.id, text: resolved ? "Reopen" : "Mark resolved" });
+      btn.addEventListener("click", async function () {
+        btn.disabled = true;
+        var res = await sb.rpc("owner_set_feedback", { p_id: r.id, p_resolved: !resolved });
+        if (res.error) { toast(humanize(res.error)); btn.disabled = false; return; }
+        r.resolved_at = resolved ? null : new Date().toISOString();
+        paint(); countPaint();
+      });
+      list.append(h("div", { class: "fb-item", "data-fb": r.id, style: "border-top:1px solid var(--line);padding:10px 0;" + (resolved ? "opacity:.65" : "") },
+        h("div", { style: "display:flex;gap:8px;flex-wrap:wrap;align-items:center;justify-content:space-between" },
+          h("span", { class: "chips" }, h("span", { class: "chip " + (r.kind === "bug" ? "red" : ""), text: r.kind === "bug" ? "Bug" : "Suggestion" }),
+            resolved ? h("span", { class: "chip grey", text: "Resolved " + when(r.resolved_at) }) : null),
+          btn),
+        h("p", { class: "muted", style: "font-size:13px;margin:6px 0", text: (r.author_name || "Unknown") + (r.author_email ? " · " + r.author_email : "") + " · " + when(r.created_at) }),
+        h("p", { style: "white-space:pre-wrap;overflow-wrap:anywhere;margin:0", text: r.message })));
+    });
+  }
+  function countPaint() {
+    var n = rows.filter(function (r) { return !r.resolved_at; }).length;
+    var el = document.getElementById("a-feedback"); if (el) el.textContent = String(n);
+  }
+  toggle.addEventListener("click", function () { showResolved = !showResolved; paint(); });
+  card.append(h("div", { style: "display:flex;justify-content:space-between;gap:8px;align-items:center;flex-wrap:wrap" }, h("h3", { text: "Feedback" }), toggle), list);
+  list.append(h("p", { class: "muted", text: "Loading…" }));
+  sb.rpc("owner_feedback").then(function (r) {
+    if (r.error) { list.replaceChildren(h("p", { class: "err", role: "alert", id: "fb-old-db", text: "Couldn’t load feedback. Re-run the latest setup.sql in Supabase if you haven’t yet." })); return; }
+    rows = r.data || []; paint(); countPaint();
+  });
+  return card;
+}
 function adminView() {
   var wrap = h("div", { class: "panel", id: "admin-view" });
   var body = h("div");
@@ -941,10 +1077,12 @@ function adminView() {
     body.replaceChildren();
     var tiles = h("dl", { class: "stats", id: "admin-totals", style: "grid-template-columns:repeat(auto-fit,minmax(130px,1fr))" });
     [["People", t.users, "a-users"], ["Groups", t.groups, "a-groups"], ["Wishlists", t.wishlists, "a-wishlists"], ["Lists started", t.lists, "a-lists"],
-     ["Lists shared", t.lists_shared, "a-shared"], ["Items", t.items, "a-items"], ["Gifts picked", t.purchases, "a-purchases"]].forEach(function (x) {
+     ["Lists shared", t.lists_shared, "a-shared"], ["Items", t.items, "a-items"], ["Gifts picked", t.purchases, "a-purchases"],
+     ["Secret Santas", t.santas || 0, "a-santas"], ["Open feedback", t.open_feedback || 0, "a-feedback"]].forEach(function (x) {
       tiles.append(h("div", { class: "card", style: "padding:12px" }, h("dt", { text: x[0] }), h("dd", { id: x[2], style: "font-size:24px", text: String(x[1]) })));
     });
     body.append(tiles);
+    body.append(feedbackLog());
     var range = h("div", { class: "tabs", role: "tablist", style: "max-width:260px;margin-top:16px" });
     [30, 90].forEach(function (n) {
       range.append(h("button", { class: "tab", type: "button", role: "tab", id: "range-" + n, "aria-selected": adminDays === n ? "true" : "false",
@@ -968,7 +1106,7 @@ function adminView() {
           onclick: function () { route = { name: "admin-group", id: g.id }; renderMain(); window.scrollTo({ top: 0 }); } },
           h("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center" },
             h("h3", { text: g.name }),
-            h("span", { class: "chips" }, g.kind === "registry" ? h("span", { class: "chip", text: "Wishlist" }) : null, g.archived ? h("span", { class: "chip grey", text: "Archived" }) : null)),
+            h("span", { class: "chips" }, g.kind === "registry" ? h("span", { class: "chip", text: "Wishlist" }) : null, g.kind === "secret_santa" ? h("span", { class: "chip", text: "Secret Santa" }) : null, g.archived ? h("span", { class: "chip grey", text: "Archived" }) : null)),
           h("dl", { class: "stats", style: "grid-template-columns:repeat(auto-fit,minmax(110px,1fr));margin-top:8px" },
             h("div", null, h("dt", { text: "Members" }), h("dd", { class: "ag-members", text: String(g.members) })),
             h("div", null, h("dt", { text: "Items" }), h("dd", { class: "ag-items", text: String(g.items) })),
@@ -997,7 +1135,7 @@ function adminGroupView() {
     body.replaceChildren(
       h("div", { class: "dash-head" },
         h("div", { class: "page-head" }, h("h2", { id: "ag-title", text: g.name }),
-          h("p", { class: "muted", text: (g.kind === "registry" ? "Wishlist" : "Group") + " · " + g.members + " member" + (g.members === 1 ? "" : "s") + " · event " + fmtDay(g.event_date) + " · created " + fmtDay(g.created_at) + " by " + g.created_by + (g.archived ? " · archived" : "") })),
+          h("p", { class: "muted", text: (g.kind === "registry" ? "Wishlist" : g.kind === "secret_santa" ? "Secret Santa" + (g.drawn ? " (names drawn)" : "") : "Group") + " · " + g.members + " member" + (g.members === 1 ? "" : "s") + " · event " + fmtDay(g.event_date) + " · created " + fmtDay(g.created_at) + " by " + g.created_by + (g.archived ? " · archived" : "") })),
         back),
       h("div", { class: "card", id: "ag-banner", style: "padding:10px 12px;margin-bottom:12px" }, h("strong", { text: "Admin view, read only. " }), h("span", { class: "muted", text: "You can look at every list, but nothing here can be changed." })));
     if (!lists.length) body.append(h("p", { class: "muted", text: "No lists in this group yet." }));
@@ -1006,7 +1144,9 @@ function adminGroupView() {
         h("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" },
           h("h3", { text: l.owner_name + (l.for_someone_else ? " (made by " + (l.managed_by || "the admin") + ")" : "") }),
           h("span", { class: "chip " + (l.shared ? "" : "grey"), text: l.shared ? "Shared" : "Not shared" })));
-      if (!l.items.length) card.append(h("p", { class: "muted", text: "No items yet." }));
+      if (l.about) card.append(h("p", { class: "muted", style: "white-space:pre-wrap;overflow-wrap:anywhere", text: "About: " + l.about }));
+      if (g.kind === "secret_santa") card.append(h("p", { class: "muted", id: "ag-hidden", text: (l.item_count || 0) + " wish" + (l.item_count === 1 ? "" : "es") + ". Secret Santa lists stay private, even from you." }));
+      else if (!l.items.length) card.append(h("p", { class: "muted", text: "No items yet." }));
       l.items.forEach(function (it) {
         card.append(h("div", { class: "wish", "data-item": it.name, style: "display:flex;gap:10px;align-items:flex-start;padding:8px 0;border-top:1px solid var(--line)" },
           itemPhoto(it, "wish-img"),
@@ -1072,18 +1212,20 @@ function newOrbitView() {
     h("div", { class: "page-head" }, h("h2", { text: "New orbit" }), h("p", { class: "muted", text: "What kind of orbit do you want to start?" })),
     option("pick-group", "Group event", "Everyone in the group makes their own wishlist, and everyone can shop from each other’s lists. Good for family Christmas, friends or a gift swap.", "new"),
     option("pick-wishlist", "One-way wishlist", "You write the lists, like a birthday or Christmas list for your kids. People with your link can view them and pick gifts, but can’t make lists of their own.", "new-wishlist"),
+    option("pick-santa", "Secret Santa", "Everyone shares a list, then you draw names. Each person is given one list to buy from. Nobody can see anyone else’s list, and not even you will know who has whom.", "new-santa"),
     h("button", { class: "btn ghost", type: "button", id: "orbit-cancel", onclick: function () { route = { name: "dashboard" }; renderMain(); }, text: "Cancel" }));
 }
 
-function newGroupView() {
+function newGroupView(kind) {
+  var santa = kind === "secret_santa";
   var f = { name: "", date: "", min: "3" };
   var err = h("p", { class: "err", hidden: true, role: "alert", id: "g-err" });
-  var btn = h("button", { class: "btn primary", type: "submit", id: "g-create", text: "Create group" });
+  var btn = h("button", { class: "btn primary", type: "submit", id: "g-create", text: santa ? "Create Secret Santa" : "Create group" });
   var form = h("form", { class: "card item", id: "g-form", novalidate: true },
-    h("div", { class: "page-head" }, h("h2", { text: "New group event" })),
+    h("div", { class: "page-head" }, h("h2", { text: santa ? "New Secret Santa" : "New group event" })),
     h("div", { class: "card", id: "g-how", style: "padding:10px 12px;margin-bottom:12px" },
-      h("strong", { text: "How sharing works" }),
-      h("p", { class: "muted", style: "margin:4px 0 0;font-size:14px", text: "You get an invite link to send around. Everyone who joins writes their own wishlist and shares it when it’s ready. Once shared, the whole group can see it and mark gifts as purchased. The person the list belongs to never sees who bought what, so gifts stay a surprise. Members can also make lists for others, like their kids." })),
+      h("strong", { text: santa ? "How Secret Santa works" : "How sharing works" }),
+      h("p", { class: "muted", style: "margin:4px 0 0;font-size:14px", id: santa ? "g-how-santa" : "g-how-text", text: santa ? "You get an invite link to send around. Everyone who joins writes a list and shares it. Players can see who has joined and who has shared, but nobody can read any list yet, and you are only told when lists are shared. When enough people have shared, you press a button to draw names. Each player is then given one other player’s list at random, can read it and mark gifts as purchased, and is emailed. The draw is final, and you won’t be able to see who has whom, so you can play too." : "You get an invite link to send around. Everyone who joins writes their own wishlist and shares it when it’s ready. Once shared, the whole group can see it and mark gifts as purchased. The person the list belongs to never sees who bought what, so gifts stay a surprise. Members can also make lists for others, like their kids." })),
     h("div", { class: "field" }, h("label", { for: "g-name", text: "Group name" }),
       h("input", { id: "g-name", type: "text", maxlength: "60", placeholder: "Family Christmas, Office swap…", autocomplete: "off", oninput: function (e) { f.name = e.target.value; } })),
     h("div", { class: "field" }, h("label", { for: "g-date", text: "Event date" }),
@@ -1104,15 +1246,15 @@ function newGroupView() {
     if (problem) { err.textContent = problem; err.hidden = false; return; }
     err.hidden = true; btn.disabled = true; btn.textContent = "Creating…";
     try {
-      var id = await api(sb.rpc("create_group", { p_name: f.name.trim(), p_event: f.date, p_min: min }));
+      var id = await api(sb.rpc(santa ? "create_secret_santa" : "create_group", { p_name: f.name.trim(), p_event: f.date, p_min: min }));
       await openGroup(id, "manage");
-      toast("Group created. Share the invite link to bring people in.");
-    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = "Create group"; }
+      toast(santa ? "Secret Santa created. Share the invite link to bring players in." : "Group created. Share the invite link to bring people in.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = santa ? "Create Secret Santa" : "Create group"; }
   });
   setTimeout(function () { var el = document.getElementById("g-name"); if (el) el.focus(); }, 0);
   return h("div", { class: "panel" },
     h("button", { class: "btn ghost back", type: "button", id: "back-dash", onclick: function () { route = { name: "dashboard" }; renderMain(); } }, icon("back"), "All groups"),
-    h("div", { class: "page-head" }, h("h2", { text: "New wish group" }),
+    h("div", { class: "page-head" }, h("h2", { text: santa ? "New Secret Santa group" : "New wish group" }),
       h("p", { class: "muted", text: "You’ll be the admin. After creating it you can copy an invite link for the people you want to join." })),
     form);
 }
@@ -1131,8 +1273,8 @@ function joinView() {
   }
   var already = groups.find(function (g) { return g.name === joinInfo.group_name && g.event_date === joinInfo.event_date; });
   var err = h("p", { class: "err", hidden: true, role: "alert", id: "join-err" });
-  var wl = joinInfo.kind === "registry";
-  var btn = h("button", { class: "btn primary", type: "button", id: "join-go", text: wl ? "Open wishlist" : "Join group", disabled: joinInfo.archived && !already ? true : null });
+  var wl = joinInfo.kind === "registry", ss = joinInfo.kind === "secret_santa";
+  var btn = h("button", { class: "btn primary", type: "button", id: "join-go", text: wl ? "Open wishlist" : ss ? "Join Secret Santa" : "Join group", disabled: (joinInfo.archived || joinInfo.drawn) && !already ? true : null });
   btn.addEventListener("click", async function () {
     btn.disabled = true; btn.textContent = "Joining…";
     try {
@@ -1140,8 +1282,8 @@ function joinView() {
       finishJoinLink();
       await loadGroups();
       await openGroup(id);
-      toast(wl ? "You’re in! Open a list and mark gifts as purchased." : "You’re in! Add your wishes whenever you’re ready.");
-    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = wl ? "Open wishlist" : "Join group"; }
+      toast(wl ? "You’re in! Open a list and mark gifts as purchased." : ss ? "You’re in! Write your list and share it when it’s ready." : "You’re in! Add your wishes whenever you’re ready.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = wl ? "Open wishlist" : ss ? "Join Secret Santa" : "Join group"; }
   });
   wrap.append(heroView((wl ? "Open " : "Join ") + joinInfo.group_name + "?", "You’re signed in as " + myEmail + ". You’ll sign in with this email whenever you come back." + (wl ? " You’ll be able to see the lists and mark gifts as purchased." : ""), "You’re invited"),
     h("div", { class: "card" },
@@ -1149,6 +1291,8 @@ function joinView() {
         h("div", null, h("dt", { text: "Event date" }), h("dd", { text: fmtDay(joinInfo.event_date) })),
         h("div", null, h("dt", { text: wl ? "Lists" : "Members so far" }), h("dd", { text: String(joinInfo.member_count) })))),
     joinInfo.archived && !already ? h("div", { class: "note warn" }, icon("lock"), h("span", { text: "This group is archived and closed to new members." })) : "",
+    ss && joinInfo.drawn && !already ? h("div", { class: "note warn", id: "join-drawn" }, icon("lock"), h("span", { text: "The names have already been drawn, so no one else can join." })) : "",
+    ss && !joinInfo.drawn ? h("div", { class: "note", id: "join-santa-note" }, icon("lock"), h("span", { text: "This is a Secret Santa. You’ll write a list and share it. When the host draws names you’ll be given one person’s list to buy from. No one else’s list is visible, and no one can see yours except the person who draws you." })) : "",
     err,
     h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, btn,
       h("button", { class: "btn ghost", type: "button", id: "join-cancel", onclick: function () { finishJoinLink(); route = { name: "dashboard" }; renderMain(); }, text: "Not now" })));
@@ -1185,7 +1329,7 @@ function boughtCount() {
     if (m === myId) return;
     listFor(m).items.forEach(function (it) { if (iBought(it)) n++; });
   });
-  return n;
+  return n + (gd.extras || []).length;
 }
 function updateTabs() {
   if (!ui.tabFam || !gd) return;
@@ -1208,6 +1352,12 @@ function updateTabs() {
   }
   var others = gd.members.filter(function (m) { return m !== myId; });
   var ready = others.filter(function (m) { return listFor(m).state === "ready"; }).length;
+  if (isSanta()) {
+    var sharedN = gd.members.filter(function (m) { return !!(gd.listMeta.get(m) || {}).submitted_at; }).length;
+    ui.tabFam.replaceChildren(document.createTextNode("Players"), h("span", { class: "badge", title: sharedN + " of " + gd.members.length + " have shared a list", text: sharedN + "/" + gd.members.length }));
+    ui.tabPur.replaceChildren(document.createTextNode("Purchases"), h("span", { class: "badge", text: String(boughtCount()) }));
+    return;
+  }
   ui.tabFam.replaceChildren(document.createTextNode(reg ? "Lists" : "Everyone"), h("span", { class: "badge", title: ready + " of " + others.length + " lists ready", text: ready + "/" + others.length }));
   ui.tabPur.replaceChildren(document.createTextNode("Purchases"), h("span", { class: "badge", text: String(boughtCount()) }));
 }
@@ -1222,9 +1372,12 @@ function renderPanel() {
   if (isRegistry() && v === "my") v = route.view = "members";
   if (v.indexOf("edit:") === 0 && !canManageList(v.slice(5))) v = route.view = "members";
   if (v.indexOf("edit:") === 0 && isArchived()) v = route.view = "member:" + v.slice(5);
-  if (v === "my") ui.panel.append(isArchived() ? readOnlyListView() : editorView());
+  if (isSanta() && v.indexOf("member:") === 0 && v.slice(7) !== gd.assigned) v = route.view = "members";
+  if (isSanta() && v === "draw" && (!isAdmin() || isDrawn() || isArchived())) v = route.view = "manage";
+  if (v === "draw") ui.panel.append(santaDrawView());
+  else if (v === "my") ui.panel.append(isArchived() ? readOnlyListView() : editorView());
   else if (v.indexOf("edit:") === 0) ui.panel.append(editorView());
-  else if (v === "members") ui.panel.append(membersView());
+  else if (v === "members") ui.panel.append(isSanta() ? santaPlayersView() : membersView());
   else if (v === "purchases") ui.panel.append(purchasesView());
   else if (v === "manage") ui.panel.append(manageView());
   else ui.panel.append(memberView(v.slice(7)));
@@ -1237,6 +1390,7 @@ function readOnlyListView() {
   var wrap = h("div", { class: "panel" });
   wrap.append(h("div", { class: "page-head" }, h("h2", { text: "Your list" }),
     h("p", { class: "muted", text: items.length ? "This group is archived, so your list is now read-only." : "This group is archived, so lists can no longer be added." })));
+  if (aboutCard(myId)) wrap.append(aboutCard(myId));
   items.forEach(function (it) {
     var main = h("div", { class: "wish-main" }, h("h3", { text: it.name }), h("p", { class: "desc", text: it.description }));
     if (it.quantity !== 1) main.append(h("p", { class: "wanted" }, "Quantity: ", h("b", { text: qtyText(it.quantity) })));
@@ -1252,6 +1406,7 @@ function registryEditorView(owner) {
     h("p", { class: "muted", text: isRegistry()
       ? "Add as many wishes as you like. Anyone with the invite link sees changes right away and can mark gifts as purchased. As the admin, you can also see who has marked what."
       : "You made this list, so you can edit it. Everyone in the group sees changes right away and can mark gifts as purchased, and you can see who has marked what. Anything you buy from it is marked as bought by you." })));
+  wrap.append(aboutField(editor.owner));
   ui.items = h("div", { class: "items" });
   wrap.append(ui.items);
   wrap.append(h("button", { class: "btn", type: "button", id: "add-item", onclick: function () {
@@ -1265,6 +1420,29 @@ function registryEditorView(owner) {
   rebuildItems(); updateBar();
   return wrap;
 }
+/* the "about me" note at the top of a list */
+var ABOUT_MAX = 1000;
+function aboutField(owner) {
+  var mine = owner === myId;
+  var label = mine ? "About me" : "About " + nameOf(owner);
+  var count = h("span", { class: "muted", id: "about-count", style: "font-size:13px" });
+  var box = h("textarea", { id: "about-text", rows: "3", maxlength: String(ABOUT_MAX), "aria-describedby": "about-count",
+    placeholder: mine ? "Tell people a bit about you: recent hobbies and interests, sizes, or things you’d rather not get (no more socks, please!)"
+      : "A few things to help people shop: hobbies, interests, sizes, or things not to buy",
+    oninput: function (e) { editor.about = e.target.value; paint(); updateBar(); } });
+  box.value = editor.about || "";
+  function paint() {
+    var n = box.value.length;
+    count.textContent = n + " / " + ABOUT_MAX;
+    count.style.color = n >= ABOUT_MAX ? "var(--danger)" : "";
+  }
+  paint();
+  return h("div", { class: "card", id: "about-card" },
+    h("div", { class: "field" },
+      h("div", { style: "display:flex;justify-content:space-between;gap:8px;align-items:baseline" }, h("label", { for: "about-text", text: label }), count),
+      box,
+      h("p", { class: "muted", style: "font-size:13px;margin:4px 0 0", text: "Shown at the top of the list for everyone who can see it. Up to " + ABOUT_MAX + " characters." })));
+}
 function editorView() {
   if (editingOwner() !== myId) {
     var owner = editingOwner();
@@ -1274,13 +1452,15 @@ function editorView() {
   if (!editor || editor.owner !== myId) initEditor();
   var min = minItems();
   var wrap = h("div", { class: "panel" });
-  var pill = h("span", { class: "status-pill " + (editor.submitted ? "live" : "draft"), text: editor.submitted ? "Shared with the group" : "Draft. Nobody else can see it yet" });
+  var pill = h("span", { class: "status-pill " + (editor.submitted ? "live" : "draft"), text: editor.submitted ? (isSanta() ? "Shared. Only your Secret Santa will see it" : "Shared with the group") : "Draft. Nobody else can see it yet" });
   wrap.append(h("div", { class: "page-head" }, h("h2", { text: "Your list" }), pill,
     h("p", { class: "muted", text: editor.submitted
-      ? "Edit anything below and save. The group sees changes right away."
-      : "Add at least " + min + (min === 1 ? " thing" : " things") + " you’d love. Each needs a name and a short description. A link helps people find the right one, and quantity is optional. Submitting emails the rest of the group." })));
+      ? (isSanta() ? "Edit anything below and save. Your Secret Santa sees changes right away." : "Edit anything below and save. The group sees changes right away.")
+      : "Add at least " + min + (min === 1 ? " thing" : " things") + " you’d love. Each needs a name and a short description. A link helps people find the right one, and quantity is optional. Submitting " + (isSanta() ? "tells the host your list is ready." : "emails the rest of the group.") })));
   wrap.append(h("div", { class: "note" }, icon("lock"),
-    h("span", { text: "Others mark gifts as purchased so nobody doubles up. You won’t see which ones, so the surprise stays intact." })));
+    h("span", { text: isSanta() ? "No one can read your list until the names are drawn, and then only the one person who is given it. You won’t see who that is, so the surprise stays intact."
+      : "Others mark gifts as purchased so nobody doubles up. You won’t see which ones, so the surprise stays intact." })));
+  wrap.append(aboutField(editor.owner));
   ui.items = h("div", { class: "items" });
   wrap.append(ui.items);
   wrap.append(h("button", { class: "btn", type: "button", id: "add-item", onclick: function () {
@@ -1327,7 +1507,9 @@ function itemCard(it, i) {
     oninput: function (e) { it.description = e.target.value; changed(); } });
   inDesc.value = it.description;
   var inLink = h("input", { id: "f-" + k + "-link", type: "url", inputmode: "url", maxlength: "2000", value: it.link, autocomplete: "off", placeholder: "https://",
-    oninput: function (e) { it.link = e.target.value; changed(); }, onblur: function () { it._lt = true; paint(); autoLookup(); } });
+    oninput: function (e) { it.link = e.target.value; changed(); clearTimeout(it._timer); it._timer = setTimeout(autoLookup, 1200); },
+    onpaste: function () { clearTimeout(it._timer); it._timer = setTimeout(autoLookup, 60); },
+    onblur: function () { it._lt = true; paint(); clearTimeout(it._timer); autoLookup(); } });
   var inQty = h("input", { id: "f-" + k + "-qty", type: "number", min: "1", max: "9999", step: "1", inputmode: "numeric", value: it.qty, "aria-label": "Quantity",
     disabled: it.unlimited ? true : null,
     oninput: function (e) { it.qty = e.target.value; changed(); } });
@@ -1345,13 +1527,10 @@ function itemCard(it, i) {
   var thumb = h("img", { class: "pv-img", alt: "", referrerpolicy: "no-referrer", hidden: true });
   thumb.addEventListener("error", function () { thumb.hidden = true; });
   var pvMsg = h("span", { class: "pv-msg muted" });
-  var pvBtn = h("button", { class: "btn sm", type: "button", id: "f-" + k + "-lookup", text: "Get photo and price from link", onclick: function () { lookup(true); } });
-  var pvRm = h("button", { class: "btn sm ghost", type: "button", text: "Remove photo", hidden: true, onclick: function () { it.image = ""; paintPv(); changed(); } });
-  var pv = h("div", { class: "pv" }, thumb, h("div", { class: "pv-body" }, pvMsg, h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, pvBtn, pvRm)));
+  var pvRm = h("button", { class: "btn sm ghost", type: "button", text: "Remove photo", hidden: true, onclick: function () { it.image = ""; it.autoImg = false; paintPv(); changed(); } });
+  var pv = h("div", { class: "pv" }, thumb, h("div", { class: "pv-body" }, pvMsg, h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, pvRm)));
   function paintPv() {
     var ok = normLink(it.link);
-    pvBtn.hidden = !ok;
-    pvBtn.disabled = !!it._busy;
     thumb.hidden = !it.image;
     if (it.image) { thumb.src = it.image; thumb.alt = it.name || "Item photo"; }
     pvRm.hidden = !it.image;
@@ -1359,19 +1538,20 @@ function itemCard(it, i) {
   }
   function autoLookup() {
     var nl = normLink(it.link);
-    if (nl && nl !== it.looked) lookup(false);
+    if (nl && nl !== it.looked) lookup();
   }
-  async function lookup(force) {
+  async function lookup() {
     var nl = normLink(it.link);
     if (!nl || it._busy) return;
     it._busy = true; it.looked = nl; pvMsg.textContent = "Looking up the photo and price…"; paintPv();
     try {
       var r = await lookupLink(nl);
       var gotImg = false, gotPrice = false;
-      if (r && r.image && (force || !it.image)) { it.image = r.image; gotImg = true; }
-      if (r && r.price && (force || !it.price.trim() || it.autoPrice)) {
+      if (r && r.image && (!it.image || it.autoImg)) { it.image = r.image; it.autoImg = true; gotImg = true; }
+      if (r && r.price && (!it.price.trim() || it.autoPrice)) {
         it.price = priceText(r.price, r.currency); it.asOf = fmtDay(todayStr()); it.autoPrice = true; inPrice.value = it.price; gotPrice = true;
       }
+      if (r && !r.image && it.autoImg) { it.image = ""; it.autoImg = false; }
       pvMsg.textContent = gotImg && gotPrice ? "Found a photo and price. Check them before saving."
         : gotImg ? "Found a photo. This site didn’t share a price, so you can type one in."
         : gotPrice ? "Found a price. This site didn’t share a photo."
@@ -1405,7 +1585,7 @@ function updateBar() {
   if (!ui.count) return;
   if (editor.registry) {
     var rr = cleanItems(), nn = rr.complete.length;
-    var dirtyR = sig(rr.complete) !== editor.baseSig || rr.problems > 0;
+    var dirtyR = sig(rr.complete) !== editor.baseSig || rr.problems > 0 || aboutDirty();
     ui.count.textContent = rr.problems > 0 ? plural(rr.problems, "item needs", "items need") + " fixing"
       : !dirtyR ? (nn ? "All changes saved · " + plural(nn, "item", "items") : "No items yet") : plural(nn, "item", "items") + " ready to save";
     ui.count.className = "count " + (rr.problems > 0 ? "bad" : !dirtyR && nn ? "ok" : "");
@@ -1415,7 +1595,7 @@ function updateBar() {
   }
   var min = minItems();
   var r = cleanItems(), n = r.complete.length;
-  var dirty = sig(r.complete) !== editor.baseSig || r.problems > 0;
+  var dirty = sig(r.complete) !== editor.baseSig || r.problems > 0 || aboutDirty();
   var msg, cls = "";
   if (r.problems > 0) { msg = plural(r.problems, "item needs", "items need") + " fixing"; cls = "bad"; }
   else if (n < min) { msg = n + " of " + min + " required items ready"; }
@@ -1456,7 +1636,7 @@ function membersView() {
   others.forEach(function (m) {
     var info = listFor(m);
     if (info.state !== "ready") { waiting.push(m); return; }
-    var n = info.items.filter(iBought).length;
+    var n = info.items.filter(iBought).length + extrasFor(m).length;
     mineBy.set(m, n);
     if (n === 0) toShop.push(m);
   });
@@ -1546,6 +1726,12 @@ function claimSide(it) {
   if (show.length) side.append(h("p", { class: "also", text: (mine ? "Also selected by " : full ? "Claimed by " : "Selected by ") + show.map(nameOf).join(", ") }));
   return side;
 }
+function aboutCard(owner) {
+  var t = (gd.about.get(owner) || "").trim();
+  if (!t) return null;
+  return h("div", { class: "card about-me", id: "about-shown" }, h("h3", { text: "About " + (owner === myId ? "you" : nameOf(owner)) }),
+    h("p", { style: "white-space:pre-wrap;overflow-wrap:anywhere;margin:6px 0 0", text: t }));
+}
 function memberView(member) {
   var info = listFor(member);
   var wrap = h("div", { class: "panel" });
@@ -1561,6 +1747,7 @@ function memberView(member) {
   wrap.append(h("div", { class: "who-head" }, avatar(member, "lg"),
     h("div", null, h("h2", { text: possessive(member) + " list" }), h("p", { class: "muted", text: plural(items.length, "wish", "wishes") })),
     canEdit ? h("button", { class: "btn sm", type: "button", id: "edit-list", style: "margin-left:auto", onclick: function () { setView("edit:" + member); } }, "Edit list") : null));
+  wrap.append(aboutCard(member));
   wrap.append(h("div", { class: "card" },
     h("div", { class: "prog-row" }, h("span", { text: "Purchased" }), h("span", { text: bought + " of " + items.length })),
     h("div", { class: "progress" }, h("b", { style: "width:" + Math.round(bought / items.length * 100) + "%" }))));
@@ -1585,39 +1772,241 @@ function itemPhoto(it, cls) {
   return img;
 }
 
+/* Secret Santa: who has joined and who has shared, but never any list */
+function santaShared(m) { return !!(gd.listMeta.get(m) || {}).submitted_at; }
+function santaPlayersView() {
+  var wrap = h("div", { class: "panel" });
+  var drawn = isDrawn();
+  wrap.append(h("div", { class: "page-head" }, h("h2", { text: "Players" }),
+    h("p", { class: "muted", text: drawn ? "The names have been drawn." : "You can see who has joined and who has shared a list. Lists stay private until the names are drawn, and then you’ll only see the one you’re given." })));
+  if (drawn) {
+    if (gd.assigned) {
+      wrap.append(h("div", { class: "card stack", id: "santa-pick" },
+        h("span", { class: "eyebrow", text: "Your Secret Santa pick" }),
+        h("h3", { text: nameOf(gd.assigned) }),
+        h("p", { class: "muted", text: "Open their list to see what they’d like, and mark gifts as purchased. Keep it a secret." }),
+        h("button", { class: "btn primary", type: "button", id: "open-pick", onclick: function () { setView("member:" + gd.assigned); }, text: "Open " + possessive(gd.assigned) + " list" })));
+    } else {
+      wrap.append(h("div", { class: "note warn", id: "santa-out" }, icon("lock"), h("span", { text: "The names were drawn before your list was shared, so you weren’t given anyone." })));
+    }
+  } else if (!santaShared(myId)) {
+    wrap.append(h("div", { class: "note warn", id: "santa-share-note" }, icon("lock"), h("span", { text: "Share your list to be part of the draw." }),
+      h("button", { class: "btn sm", type: "button", onclick: function () { setView("my"); }, text: "Open my list" })));
+  }
+  var card = h("div", { class: "card", id: "santa-players" });
+  gd.members.forEach(function (m) {
+    var shared = santaShared(m);
+    card.append(h("div", { class: "who-head", "data-player": nameOf(m), style: "padding:6px 0" }, avatar(m, "md"),
+      h("div", { style: "flex:1;min-width:0" }, h("strong", { text: nameOf(m) + (m === myId ? " (you)" : "") })),
+      h("span", { class: "chips" },
+        h("span", { class: "chip " + (shared ? "" : "grey"), "data-shared": shared ? "yes" : "no", text: shared ? "List shared" : "No list yet" }))));
+  });
+  wrap.append(card);
+  return wrap;
+}
+function santaDrawCard() {
+  var shared = gd.members.filter(santaShared), waiting = gd.members.filter(function (m) { return !santaShared(m); });
+  var card = h("div", { class: "card stack", id: "draw-card" }, h("h3", { text: "Draw the names" }));
+  if (isDrawn()) {
+    card.append(h("p", { class: "muted", id: "draw-done", text: "The names have been drawn and every player has been emailed their pick. For the fun of it, you can’t see who has whom." }));
+    return card;
+  }
+  if (isArchived()) { card.append(h("p", { class: "muted", text: "This group is archived, so the names can no longer be drawn." })); return card; }
+  card.append(h("p", { class: "muted", text: plural(shared.length, "player has", "players have") + " shared a list" + (waiting.length ? ". Still waiting on " + waiting.map(nameOf).join(", ") + "." : ".") }),
+    h("p", { class: "muted", style: "font-size:13px", text: "You need at least 3 players with shared lists. Only players who have shared a list are part of the draw." }),
+    h("button", { class: "btn primary", type: "button", id: "draw-start", disabled: shared.length < 3 ? true : null, onclick: function () { setView("draw"); }, text: "Assign Secret Santas" }));
+  return card;
+}
+function santaDrawView() {
+  var inn = gd.members.filter(santaShared), out = gd.members.filter(function (m) { return !santaShared(m); });
+  var err = h("p", { class: "err", hidden: true, role: "alert", id: "draw-err" });
+  var go = h("button", { class: "btn danger", type: "button", id: "draw-confirm", text: "Yes, draw the names now" });
+  go.addEventListener("click", async function () {
+    go.disabled = true; go.textContent = "Drawing…"; err.hidden = true;
+    try {
+      var n = await api(sb.rpc("start_secret_santa", { p_group: route.id }));
+      await loadGroups(); await loadGroup();
+      route.view = "members"; renderPanel(); updateTabs();
+      toast("Names drawn. " + plural(n || inn.length, "player has", "players have") + " been emailed their pick.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; go.disabled = false; go.textContent = "Yes, draw the names now"; }
+  });
+  return h("div", { class: "panel", id: "draw-screen" },
+    h("div", { class: "page-head" }, h("h2", { text: "Draw the names?" }), h("p", { class: "muted", text: "Please check who is in before you begin." })),
+    h("div", { class: "card stack" },
+      h("h3", { text: "In the draw (" + inn.length + ")" }),
+      h("ul", { id: "draw-in", style: "margin:0;padding-left:20px" }, inn.map(function (m) { return h("li", { text: nameOf(m) + (m === myId ? " (you)" : "") }); })),
+      out.length ? h("h3", { text: "Left out, no list shared (" + out.length + ")" }) : null,
+      out.length ? h("ul", { id: "draw-out", style: "margin:0;padding-left:20px" }, out.map(function (m) { return h("li", { text: nameOf(m) }); })) : null,
+      out.length ? h("p", { class: "muted", style: "font-size:13px", text: "These players won’t be given anyone, and won’t be able to join the draw afterwards." }) : null),
+    h("div", { class: "note warn", id: "draw-warning" }, icon("lock"), h("span", { text: "This can’t be undone. Once the names are drawn, each player gets one other player’s list at random and is emailed. You won’t be able to see who has whom, and no one can be added or swapped." })),
+    err,
+    h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, go,
+      h("button", { class: "btn ghost", type: "button", id: "draw-back", onclick: function () { setView("manage"); }, text: "Go back" })));
+}
+
 /* purchases summary */
+/* things I bought that weren't on the person's list */
+function extrasFor(m) { return (gd.extras || []).filter(function (x) { return x.recipient === m; }); }
+function extraStatus(x) {
+  if (x.arrived) return { key: "arrived", label: "In hand", cls: "chip" };
+  if (x.tracking_url) return { key: "shipped", label: "On its way", cls: "chip gold" };
+  return { key: "ordered", label: "Purchased", cls: "chip grey" };
+}
+function shopTargets() {
+  return gd.members.filter(function (m) { return m !== myId && (!isSanta() || m === gd.assigned); });
+}
+async function saveExtra(x, patch) {
+  if (isArchived()) { toast("This group is archived, so nothing can be changed."); return false; }
+  var r = await sb.from("extra_purchases").update(patch).eq("id", x.id);
+  if (r.error) { toast(humanize(r.error)); return false; }
+  Object.keys(patch).forEach(function (k) { x[k] = patch[k]; });
+  return true;
+}
+function extraCard(x) {
+  var frozen = isArchived();
+  var st = h("span", { class: "chip" });
+  var trackLink = h("a", { class: "link", target: "_blank", rel: "noopener noreferrer", "data-track": x.name }, "Track package", icon("ext"));
+  function paint() {
+    var s2 = extraStatus(x);
+    st.className = s2.cls; st.textContent = s2.label; st.setAttribute("data-status", s2.key);
+    trackLink.hidden = !x.tracking_url; if (x.tracking_url) trackLink.href = x.tracking_url;
+    paintSummary();
+  }
+  var price = h("input", { type: "number", min: "0", step: "0.01", inputmode: "decimal", placeholder: "0.00", class: "paid-input", "data-extra-price": x.name,
+    "aria-label": "Price you paid for " + x.name, disabled: frozen ? true : null, value: x.price === null ? "" : x.price.toFixed(2) });
+  price.addEventListener("change", async function () {
+    var raw = price.value.trim(), n = raw === "" ? null : Number(raw);
+    if (n !== null && (!isFinite(n) || n < 0 || n >= 10000000)) { toast("Enter the amount you paid, like 24.99."); price.value = x.price === null ? "" : x.price.toFixed(2); return; }
+    if (n !== null) n = toCents(n) / 100;
+    if (await saveExtra(x, { price: n })) { price.value = n === null ? "" : n.toFixed(2); toast("Price saved. Only you can see it."); if (route.view === "purchases") renderPanel(); }
+  });
+  var note = h("textarea", { rows: "2", maxlength: "300", class: "bi-note", "data-extra-note": x.name, placeholder: "Add a note (optional)", "aria-label": "Note for " + x.name, disabled: frozen ? true : null });
+  note.value = x.note;
+  note.addEventListener("change", async function () { if (await saveExtra(x, { note: note.value.trim() || null })) toast("Note saved. Only you can see it."); else note.value = x.note; });
+  var track = h("input", { type: "url", inputmode: "url", maxlength: "2000", class: "bi-track", placeholder: "Tracking link (optional)", "data-extra-track": x.name,
+    "aria-label": "Tracking link for " + x.name, disabled: frozen ? true : null, autocomplete: "off", value: x.tracking_url });
+  track.addEventListener("change", async function () {
+    var v = track.value.trim(), nl = v ? normLink(v) : "";
+    if (nl === null) { toast("That tracking link doesn’t look right. Paste the full web address."); track.value = x.tracking_url; return; }
+    if (await saveExtra(x, { tracking_url: nl || null })) { track.value = nl; toast(nl ? "Tracking link saved." : "Tracking link removed."); }
+    paint();
+  });
+  var arrived = h("input", { type: "checkbox", checked: x.arrived ? true : null, disabled: frozen ? true : null, "data-extra-arrived": x.name });
+  arrived.addEventListener("change", async function () { if (!(await saveExtra(x, { arrived: arrived.checked }))) arrived.checked = x.arrived; paint(); });
+  var del = h("button", { class: "btn sm ghost", type: "button", "data-extra-delete": x.name, disabled: frozen ? true : null, text: "Remove" });
+  del.addEventListener("click", async function () {
+    del.disabled = true;
+    var r = await sb.from("extra_purchases").delete().eq("id", x.id);
+    if (r.error) { toast(humanize(r.error)); del.disabled = false; return; }
+    await loadGroup(); try { await loadGroups(); } catch (e) { /* ignore */ }
+    updateTabs(); renderPanel(); toast("Removed.");
+  });
+  var card = h("li", { class: "buyitem", "data-extra": x.name },
+    h("div", { class: "bi-head" }, h("span", { class: "bi-name", text: x.name }),
+      h("span", { style: "display:flex;gap:8px;align-items:center;flex-wrap:wrap" }, h("span", { class: "chip grey", text: "Not on their list" }), st,
+        h("label", { class: "paid", title: "Only you can see what you paid" }, "Paid $", price))),
+    h("div", { class: "bi-meta" }, h("span", { class: "bi-store", text: x.link ? "From " + host(x.link) : "Store not listed" }),
+      x.link ? h("a", { class: "link", href: x.link, target: "_blank", rel: "noopener noreferrer" }, "View item", icon("ext")) : null, trackLink),
+    h("div", { class: "bi-fields" }, note, track),
+    h("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap;align-items:center" },
+      h("label", { class: "chk" }, arrived, "It has arrived and I have it"), del));
+  setTimeout(paint, 0);
+  return card;
+}
+function addExtraCard() {
+  var targets = shopTargets();
+  var open = false;
+  var holder = h("div", { id: "extra-holder" });
+  var f = { recipient: targets.length === 1 ? targets[0] : "", name: "", link: "", price: "", note: "", tracking: "" };
+  function paintClosed() {
+    holder.replaceChildren(h("button", { class: "btn", type: "button", id: "add-extra", onclick: function () { open = true; paintOpen(); } }, icon("plus"), "Add a purchase that isn’t on a list"));
+  }
+  function paintOpen() {
+    var err = h("p", { class: "err", hidden: true, role: "alert", id: "extra-err" });
+    var sel = h("select", { id: "extra-who", "aria-label": "Who is it for?", onchange: function (e) { f.recipient = e.target.value; } },
+      h("option", { value: "", text: "Choose a person…" }), targets.map(function (m) { return h("option", { value: m, text: nameOf(m) }); }));
+    sel.value = f.recipient;
+    function inp(id, label, key, attrs) {
+      return h("div", { class: "field" }, h("label", { for: id, text: label }),
+        h("input", Object.assign({ id: id, autocomplete: "off", value: f[key], oninput: function (e) { f[key] = e.target.value; } }, attrs)));
+    }
+    var save = h("button", { class: "btn primary", type: "submit", id: "extra-save", text: "Save purchase" });
+    var form = h("form", { class: "card stack", id: "extra-form", novalidate: true },
+      h("h3", { text: "Add a purchase" }),
+      h("p", { class: "muted", style: "font-size:13px", text: "For something you bought that the person didn’t put on their list. Only you can see it, and it counts as shopped for." }),
+      h("div", { class: "field" }, h("label", { for: "extra-who", text: "Who is it for?" }), sel),
+      inp("extra-name", "What did you buy?", "name", { type: "text", maxlength: "80" }),
+      inp("extra-link", "Link (optional)", "link", { type: "url", inputmode: "url", maxlength: "2000", placeholder: "https://" }),
+      inp("extra-price", "Price paid (optional)", "price", { type: "number", min: "0", step: "0.01", inputmode: "decimal", placeholder: "0.00" }),
+      inp("extra-tracking", "Tracking link (optional)", "tracking", { type: "url", inputmode: "url", maxlength: "2000", placeholder: "https://" }),
+      h("div", { class: "field" }, h("label", { for: "extra-note", text: "Note (optional)" }),
+        h("textarea", { id: "extra-note", rows: "2", maxlength: "300", oninput: function (e) { f.note = e.target.value; } }, f.note)),
+      err, h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, save,
+        h("button", { class: "btn ghost", type: "button", id: "extra-cancel", onclick: function () { open = false; paintClosed(); }, text: "Cancel" })));
+    form.addEventListener("submit", async function (e) {
+      e.preventDefault();
+      var name = f.name.trim(), link = f.link.trim() ? normLink(f.link.trim()) : "", trk = f.tracking.trim() ? normLink(f.tracking.trim()) : "";
+      var price = f.price.trim() === "" ? null : Number(f.price);
+      var problem = !f.recipient ? "Choose who it is for." : !name ? "Enter what you bought."
+        : link === null ? "That link doesn’t look right. Paste the full web address."
+        : trk === null ? "That tracking link doesn’t look right. Paste the full web address."
+        : (price !== null && (!isFinite(price) || price < 0 || price >= 10000000)) ? "Enter the price like 24.99." : "";
+      if (problem) { err.textContent = problem; err.hidden = false; return; }
+      err.hidden = true; save.disabled = true;
+      try {
+        await api(sb.from("extra_purchases").insert({ group_id: route.id, buyer: myId, recipient: f.recipient, name: name, link: link || null,
+          price: price === null ? null : toCents(price) / 100, note: f.note.trim() || null, tracking_url: trk || null }));
+        await loadGroup(); try { await loadGroups(); } catch (e2) { /* ignore */ }
+        updateTabs(); renderPanel(); toast("Purchase added.");
+      } catch (ex) { err.textContent = humanize(ex); err.hidden = false; save.disabled = false; }
+    });
+    holder.replaceChildren(form);
+    setTimeout(function () { (document.getElementById(f.recipient ? "extra-name" : "extra-who") || {}).focus && document.getElementById(f.recipient ? "extra-name" : "extra-who").focus(); }, 0);
+  }
+  paintClosed();
+  return holder;
+}
+
 function purchasesView() {
   var data = [];
-  gd.members.forEach(function (m) {
-    if (m === myId) return;
-    var info = listFor(m); if (info.state !== "ready") return;
+  var people = new Set(gd.members.filter(function (m) { return m !== myId; }));
+  people.forEach(function (m) {
+    var info = listFor(m), ex = extrasFor(m);
+    if (info.state !== "ready" && !ex.length) return;
     var bought = info.items.filter(iBought);
     var cents = 0, priced = 0;
     bought.forEach(function (it) { var v = paidAmount(it); if (v !== null) { cents += toCents(v); priced++; } });
-    data.push({ member: m, total: info.items.length, bought: bought, cents: cents, priced: priced });
+    ex.forEach(function (x) { if (x.price !== null) { cents += toCents(x.price); priced++; } });
+    data.push({ member: m, total: info.items.length, bought: bought, extras: ex, cents: cents, priced: priced, count: bought.length + ex.length });
   });
-  var n = data.reduce(function (s, p) { return s + p.bought.length; }, 0);
-  var grand = data.reduce(function (s, p) { return s + p.cents; }, 0);
-  var unpriced = data.reduce(function (s, p) { return s + p.bought.length - p.priced; }, 0);
-  var withGifts = data.filter(function (p) { return p.bought.length; });
-  var without = data.filter(function (p) { return !p.bought.length; });
+  var n = data.reduce(function (s2, p) { return s2 + p.count; }, 0);
+  var grand = data.reduce(function (s2, p) { return s2 + p.cents; }, 0);
+  var unpriced = data.reduce(function (s2, p) { return s2 + p.count - p.priced; }, 0);
+  var withGifts = data.filter(function (p) { return p.count; });
+  var without = data.filter(function (p) { return !p.count && p.total; });
   var wrap = h("div", { class: "panel" });
   wrap.append(h("div", { class: "page-head" }, h("h2", { text: "Your purchases" }),
     h("p", { class: "muted", text: n ? plural(n, "gift", "gifts") + " bought for " + plural(withGifts.length, "person", "people") + "." : "Nothing marked yet." })));
+  if (!isArchived() && shopTargets().length) wrap.append(addExtraCard());
   if (!n) {
     wrap.append(h("div", { class: "card empty" }, h("h3", { text: "No purchases yet" }),
-      h("p", { class: "muted", text: "Open someone’s list and tap Mark as purchased. The gift will show up here." }),
-      h("button", { class: "btn sm", type: "button", onclick: function () { setView("members"); }, text: "Browse lists" })));
+      h("p", { class: "muted", text: isSanta() ? (isDrawn() && gd.assigned ? "Open " + possessive(gd.assigned) + " list and tap Mark as purchased. The gift will show up here." : "Once the names are drawn, your pick’s list opens here.")
+        : "Open someone’s list and tap Mark as purchased. The gift will show up here." }),
+      isSanta() ? null : h("button", { class: "btn sm", type: "button", onclick: function () { setView("members"); }, text: "Browse lists" })));
     return wrap;
   }
   // status overview: where everything stands, and which stores the gifts come from
-  var mineAll = [];
-  data.forEach(function (p) { p.bought.forEach(function (it) { mineAll.push(it); }); });
   var counts = h("dl", { class: "stats3" });
   var storeLine = h("div", { class: "chips", id: "store-chips" });
   paintSummary = function () {
     var c = { ordered: 0, shipped: 0, arrived: 0 }, st = new Map();
-    mineAll.forEach(function (it) { c[statusOf(it).key]++; var k = storeOf(it) || "No link"; st.set(k, (st.get(k) || 0) + 1); });
+    // recompute from live state so edits made in a card show up straight away
+    var live = [];
+    data.forEach(function (p) {
+      p.bought.forEach(function (it) { live.push({ key: statusOf(it).key, store: storeOf(it) }); });
+      p.extras.forEach(function (x) { live.push({ key: extraStatus(x).key, store: x.link ? host(x.link) : "" }); });
+    });
+    live.forEach(function (it) { c[it.key]++; var k = it.store || "No link"; st.set(k, (st.get(k) || 0) + 1); });
     counts.replaceChildren(
       h("div", null, h("dt", { text: "Purchased" }), h("dd", { id: "cnt-ordered", text: String(c.ordered) })),
       h("div", null, h("dt", { text: "On its way" }), h("dd", { id: "cnt-shipped", text: String(c.shipped) })),
@@ -1632,19 +2021,21 @@ function purchasesView() {
     h("p", { class: "muted", style: "font-size:13px", text: "Notes, tracking links and arrival are private to you." })));
   paintSummary();
   wrap.append(h("div", { class: "card", id: "grand-total" },
-    h("div", { class: "prog-row" }, h("span", { text: "Total spent on all lists" }), h("span", { text: plural(withGifts.length, "list", "lists") })),
+    h("div", { class: "prog-row" }, h("span", { text: isSanta() ? "Total spent" : "Total spent on all lists" }), h("span", { text: plural(withGifts.length, "list", "lists") })),
     h("div", { class: "total", id: "grand-amount", text: fmtMoney(grand) }),
     h("p", { class: "muted", style: "font-size:13px;margin-top:4px", text: unpriced
       ? plural(unpriced, "purchase doesn’t", "purchases don’t") + " have a price yet. Add what you paid below. Only you can see these amounts."
       : "Only you can see these amounts." })));
   withGifts.forEach(function (p) {
-    var rows = p.bought.map(function (it) { return buyCard(it); });
+    var rows = p.bought.map(function (it) { return buyCard(it); }).concat(p.extras.map(extraCard));
+    var canOpen = listFor(p.member).state === "ready";
     wrap.append(h("div", { class: "card", "data-list": p.member },
       h("div", { class: "who-head" }, avatar(p.member, "md"),
-        h("div", { style: "flex:1;min-width:0" }, h("h3", { text: nameOf(p.member) }), h("p", { class: "muted", text: p.bought.length + " of " + p.total + " bought" })),
+        h("div", { style: "flex:1;min-width:0" }, h("h3", { text: nameOf(p.member) }),
+          h("p", { class: "muted", text: p.total ? p.bought.length + " of " + p.total + " bought" + (p.extras.length ? " · " + p.extras.length + " not on their list" : "") : plural(p.extras.length, "purchase", "purchases") + " not on their list" })),
         h("div", { class: "list-total", "data-total": "list", text: fmtMoney(p.cents) })),
       h("ul", { class: "buylist" }, rows),
-      h("button", { class: "btn sm ghost", type: "button", onclick: function () { setView("member:" + p.member); }, text: "Open " + possessive(p.member) + " list" })));
+      canOpen ? h("button", { class: "btn sm ghost", type: "button", onclick: function () { setView("member:" + p.member); }, text: "Open " + possessive(p.member) + " list" }) : null));
   });
   if (without.length) {
     wrap.append(h("div", { class: "note warn" }, icon("lock"),
@@ -1666,8 +2057,9 @@ async function copyText(text, input) {
 function manageView() {
   var g = groupInfo();
   var wrap = h("div", { class: "panel" });
-  wrap.append(h("div", { class: "page-head" }, h("h2", { text: "Manage group" }),
-    h("p", { class: "muted", text: "Only you, the admin, can see this tab." })));
+  wrap.append(h("div", { class: "page-head" }, h("h2", { text: isSanta() ? "Host" : "Manage group" }),
+    h("p", { class: "muted", text: isSanta() ? "Only you, the host, can see this tab." : "Only you, the admin, can see this tab." })));
+  if (isSanta()) wrap.append(santaDrawCard());
 
   // invite link
   var linkCard = h("div", { class: "card stack", id: "invite-card" }, h("h3", { text: "Invite link" }));
