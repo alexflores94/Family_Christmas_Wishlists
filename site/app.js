@@ -665,13 +665,13 @@ function topBar(eyebrow, countdown, title) {
     h("button", { class: "btn sm primary", type: "button", id: "sign-out", onclick: signOut, text: "Sign out" }),
     h("button", { class: "btn sm ghost", type: "button", onclick: function () { ui.confirmRow.hidden = true; }, text: "Close" }));
   var top = h("div", { class: "top" },
-    h("div", { class: "brand" }, title ? null : h("span", { class: "eyebrow", text: eyebrow }), h("h1", { text: title || "Wishlist Groups" })),
+    h("div", { class: "brand" }, title ? null : h("span", { class: "eyebrow", text: eyebrow }), h("h1", { text: title || "Wish Orbit" })),
     h("div", { class: "top-right" }, countdown ? h("span", { class: "countdown", text: countdown }) : null, chip));
   return top;
 }
 function loadingView() {
   return h("div", { class: "panel", "aria-busy": "true" },
-    h("div", { class: "top" }, h("div", { class: "brand" }, h("span", { class: "eyebrow", text: "Gifts, together" }), h("h1", { text: "Wishlist Groups" }))),
+    h("div", { class: "top" }, h("div", { class: "brand" }, h("span", { class: "eyebrow", text: "Gifts, together" }), h("h1", { text: "Wish Orbit" }))),
     h("div", { class: "skeleton" }), h("div", { class: "skeleton" }));
 }
 function heroView(title, text, eyebrow) {

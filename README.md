@@ -1,4 +1,4 @@
-# Wishlist Groups: setup guide
+# Wish Orbit: setup guide
 
 About 40 minutes, no coding. Everything below has a free plan.
 
@@ -61,16 +61,16 @@ Supabase's built-in email only reaches people on your Supabase team and is limit
 1. In your Google account, turn on **2-Step Verification** if it is off, then create an **App password** (Google Account > Security > App passwords). Name it `wishlist` and copy the 16-letter password.
 2. In Supabase open **Authentication > Emails > SMTP Settings** (the menu names move around sometimes, so look for "SMTP"). Turn on custom SMTP and fill in:
    - Sender email: your Gmail address
-   - Sender name: `Family Wishlist`
+   - Sender name: `Wish Orbit`
    - Host: `smtp.gmail.com`
    - Port: `465`
    - Username: your Gmail address
    - Password: the 16-letter app password
-3. Open **Authentication > Emails > Templates**. There are two templates that matter: **Confirm sign up** (used the first time someone signs in) and **Magic Link** (used afterward). Set both to the following so the email shows a code instead of a link. Change the subject to `Your Family Wishlist code`.
+3. Open **Authentication > Emails > Templates**. There are two templates that matter: **Confirm sign up** (used the first time someone signs in) and **Magic Link** (used afterward). Set both to the following so the email shows a code instead of a link. Change the subject to `Your Wish Orbit code`.
 
 ```html
 <h2>Your sign-in code</h2>
-<p>Enter this code on the Family Wishlist site:</p>
+<p>Enter this code on the Wish Orbit site:</p>
 <p style="font-size:28px;letter-spacing:4px"><strong>{{ .Token }}</strong></p>
 <p>It expires in an hour. If you did not ask for it, ignore this email.</p>
 ```

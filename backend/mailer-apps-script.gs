@@ -1,4 +1,4 @@
-// Family Wishlist mailer: a tiny Google Apps Script that sends the family emails.
+// Wish Orbit mailer: a tiny Google Apps Script that sends the notification emails.
 // The database calls this web app when someone submits a list and for the
 // 3-day reminders. Emails come from the Google account that deploys the script.
 //
@@ -21,9 +21,9 @@ function doPost(e) {
       if (/^[^@\s]+@[^@\s]+\.[^@\s]+$/.test(address)) {
         MailApp.sendEmail({
           to: address,
-          subject: String(data.subject || 'Family Wishlist').slice(0, 200),
+          subject: String(data.subject || 'Wish Orbit').slice(0, 200),
           htmlBody: String(data.html || ''),
-          name: 'Family Wishlist'
+          name: 'Wish Orbit'
         });
         sent++;
       }
@@ -42,6 +42,6 @@ function reply_(obj) {
 // Run this once from the editor to approve permissions and confirm email works.
 function sendTestEmail() {
   var me = Session.getActiveUser().getEmail();
-  MailApp.sendEmail(me, 'Family Wishlist mailer works',
-    'If you can read this, the Family Wishlist mailer is set up.');
+  MailApp.sendEmail(me, 'Wish Orbit mailer works',
+    'If you can read this, the Wish Orbit mailer is set up.');
 }
