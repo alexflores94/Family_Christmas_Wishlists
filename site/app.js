@@ -17,6 +17,8 @@ var myEmail = null, myId = null, myName = "";   // myId is only ever shown back 
 var dashTab = "active";          // active | archived
 var joinCode = "", joinInfo = null, joinChecked = false;   // from an invite link (?join=CODE)
 var groups = [], groupsSig = "";
+var isOwner = false;               // true only for the owner email set in app_settings (checked again by the database)
+var adminDays = 30;
 var route = { name: "dashboard" };   // dashboard | new | join | group {id, view}
 var gd = null;                  // data for the open group
 var editor = null;
@@ -146,6 +148,7 @@ async function loadGroups() {
   // Groups whose event date has passed archive themselves; do it before reading so every screen agrees.
   try { await sb.rpc("sweep_archives"); } catch (e) { /* older database: ignore */ }
   groups = (await api(sb.rpc("my_groups"))) || [];
+  try { var ow = await sb.rpc("is_owner"); isOwner = !ow.error && ow.data === true; } catch (e) { isOwner = false; }
   var s = JSON.stringify(groups), changed = s !== groupsSig;
   groupsSig = s;
   return changed;
@@ -775,6 +778,7 @@ function renderMain() {
   root.append(ui.confirmRow);
   if (route.name === "new") root.append(newGroupView());
   else if (route.name === "new-wishlist") root.append(newWishlistView());
+  else if (route.name === "admin" && isOwner) root.append(adminView());
   else if (route.name === "join") root.append(joinView());
   else root.append(dashboardView());
   app.append(root);
@@ -790,6 +794,7 @@ function dashboardView() {
     h("div", { class: "page-head" }, h("h2", { text: "Your wish groups" }),
       h("p", { class: "muted", text: dashTab === "archived" ? "Archived groups and wishlists are view-only. Nothing in them can be changed." : groups.length ? "Open a group to add your wishes or shop for the people in it." : "Make a group for family, friends or a gift swap, or a wishlist to share with family." })),
     h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" },
+      isOwner ? h("button", { class: "btn", type: "button", id: "open-admin", onclick: function () { route = { name: "admin" }; renderMain(); window.scrollTo({ top: 0 }); }, text: "Admin" }) : null,
       h("button", { class: "btn", type: "button", id: "new-wishlist", onclick: function () { route = { name: "new-wishlist" }; renderMain(); window.scrollTo({ top: 0 }); } }, icon("plus"), "New wishlist"),
       h("button", { class: "btn primary", type: "button", id: "new-group", onclick: function () { route = { name: "new" }; renderMain(); window.scrollTo({ top: 0 }); } }, icon("plus"), "New group"))));
   function tab(id, key, text, n) {
@@ -827,6 +832,91 @@ function dashboardView() {
         h("div", null, h("dt", { text: "Left to shop for" }), h("dd", { class: "s-left", text: left })))));
   });
   wrap.append(grid);
+  return wrap;
+}
+
+/* owner-only dashboard: totals, daily charts, every list */
+function svgEl(tag, attrs) {
+  var e = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  Object.keys(attrs || {}).forEach(function (k) { e.setAttribute(k, attrs[k]); });
+  return e;
+}
+function barChart(rows, key, color, label) {
+  var W = 640, H = 150, pl = 28, pb = 20, pt = 8;
+  var max = Math.max(1, Math.max.apply(null, rows.map(function (r) { return r[key]; })));
+  var top = max <= 4 ? max : Math.ceil(max / 4) * 4;
+  var bw = (W - pl) / rows.length;
+  var svg = svgEl("svg", { viewBox: "0 0 " + W + " " + H, role: "img", "aria-label": label, class: "chart", preserveAspectRatio: "none" });
+  [0, 0.5, 1].forEach(function (f) {
+    var y = pt + (H - pb - pt) * (1 - f);
+    svg.append(svgEl("line", { x1: pl, x2: W, y1: y, y2: y, stroke: "currentColor", "stroke-opacity": ".12" }));
+    var t = svgEl("text", { x: pl - 4, y: y + 3, "text-anchor": "end", "font-size": "10", fill: "currentColor", "fill-opacity": ".6" });
+    t.textContent = f === 0.5 && top < 2 ? "" : String(Math.round(top * f)); svg.append(t);
+  });
+  rows.forEach(function (r, i) {
+    var hgt = (H - pb - pt) * (r[key] / top);
+    var rect = svgEl("rect", { x: pl + i * bw + 1, y: H - pb - hgt, width: Math.max(1, bw - 2), height: hgt, fill: color, rx: 2 });
+    var tt = svgEl("title"); tt.textContent = fmtDay(r.day) + ": " + r[key]; rect.append(tt);
+    svg.append(rect);
+  });
+  [0, Math.floor(rows.length / 2), rows.length - 1].forEach(function (i) {
+    var t = svgEl("text", { x: pl + i * bw + bw / 2, y: H - 5, "text-anchor": i === 0 ? "start" : i === rows.length - 1 ? "end" : "middle", "font-size": "10", fill: "currentColor", "fill-opacity": ".6" });
+    t.textContent = fmtDay(rows[i].day).replace(/, \d{4}$/, ""); svg.append(t);
+  });
+  return svg;
+}
+function adminView() {
+  var wrap = h("div", { class: "panel", id: "admin-view" });
+  var body = h("div");
+  function head() {
+    return h("div", { class: "dash-head" },
+      h("div", { class: "page-head" }, h("h2", { text: "Admin" }), h("p", { class: "muted", text: "Only you can see this page." })),
+      h("button", { class: "btn ghost", type: "button", id: "admin-back", onclick: function () { route = { name: "dashboard" }; renderMain(); }, text: "Back" }));
+  }
+  wrap.append(head(), body);
+  async function load() {
+    body.replaceChildren(h("p", { class: "muted", text: "Loading…" }));
+    var r = await sb.rpc("owner_dashboard", { p_days: adminDays });
+    if (r.error) { body.replaceChildren(h("p", { class: "err", role: "alert", text: "Couldn’t load the dashboard. Re-run the latest setup.sql in Supabase if you haven’t yet." })); return; }
+    var d = r.data, t = d.totals;
+    body.replaceChildren();
+    var tiles = h("dl", { class: "stats", id: "admin-totals", style: "grid-template-columns:repeat(auto-fit,minmax(130px,1fr))" });
+    [["People", t.users, "a-users"], ["Groups", t.groups, "a-groups"], ["Wishlists", t.wishlists, "a-wishlists"], ["Lists started", t.lists, "a-lists"],
+     ["Lists shared", t.lists_shared, "a-shared"], ["Items", t.items, "a-items"], ["Gifts picked", t.purchases, "a-purchases"]].forEach(function (x) {
+      tiles.append(h("div", { class: "card", style: "padding:12px" }, h("dt", { text: x[0] }), h("dd", { id: x[2], style: "font-size:24px", text: String(x[1]) })));
+    });
+    body.append(tiles);
+    var range = h("div", { class: "tabs", role: "tablist", style: "max-width:260px;margin-top:16px" });
+    [30, 90].forEach(function (n) {
+      range.append(h("button", { class: "tab", type: "button", role: "tab", id: "range-" + n, "aria-selected": adminDays === n ? "true" : "false",
+        onclick: function () { adminDays = n; load(); } }, "Last " + n + " days"));
+    });
+    body.append(range);
+    var sum = function (k) { return d.daily.reduce(function (a, r) { return a + r[k]; }, 0); };
+    [["users", "New people per day", "#2f7d4f"], ["lists", "Lists started per day", "#b8862b"], ["groups", "Groups and wishlists created per day", "#6b5bd2"]].forEach(function (c) {
+      body.append(h("div", { class: "card", style: "margin-top:12px" },
+        h("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" }, h("strong", { text: c[1] }), h("span", { class: "muted", id: "sum-" + c[0], text: sum(c[0]) + " in " + adminDays + " days" })),
+        barChart(d.daily, c[0], c[2], c[1])));
+    });
+    var q = h("input", { type: "search", id: "admin-filter", placeholder: "Filter lists by person or group", autocomplete: "off", style: "margin:8px 0" });
+    var table = h("div", { id: "admin-lists" });
+    function paint() {
+      var f = q.value.trim().toLowerCase();
+      var rows = d.lists.filter(function (l) { return !f || (l.owner_name + " " + l.group_name).toLowerCase().indexOf(f) >= 0; });
+      table.replaceChildren(h("p", { class: "muted", text: rows.length + " of " + d.lists.length + " lists" }));
+      rows.forEach(function (l) {
+        table.append(h("div", { class: "card", "data-owner": l.owner_name, style: "padding:10px 12px;margin-bottom:8px" },
+          h("div", { style: "display:flex;justify-content:space-between;gap:8px;flex-wrap:wrap" },
+            h("strong", { text: l.owner_name + (l.for_someone_else ? " (list made by " + (l.managed_by || "the admin") + ")" : "") }),
+            h("span", { class: "chip " + (l.shared ? "" : "grey"), text: l.shared ? "Shared" : "Not shared" })),
+          h("div", { class: "muted", style: "font-size:13px", text: l.group_name + " · " + (l.kind === "registry" ? "Wishlist" : "Group") + " · " + l.items + " item" + (l.items === 1 ? "" : "s") + " · event " + fmtDay(l.event_date) + (l.archived ? " · archived" : "") + (l.started ? " · started " + fmtDay(l.started) : "") })));
+      });
+    }
+    q.addEventListener("input", paint);
+    body.append(h("h3", { text: "All lists", style: "margin-top:20px" }), q, table);
+    paint();
+  }
+  load();
   return wrap;
 }
 

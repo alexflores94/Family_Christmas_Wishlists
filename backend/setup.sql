@@ -42,7 +42,9 @@ insert into public.app_settings (key, value) values
   ('mailer_url',    'PASTE-THE-APPS-SCRIPT-WEB-APP-URL-HERE'),
   ('mailer_secret', 'PASTE-THE-SECRET-HERE'),
   -- Groups archive themselves the day after their event date, counted in this time zone.
-  ('timezone',      'America/Los_Angeles')
+  ('timezone',      'America/Los_Angeles'),
+  -- The one sign-in email that can open the Admin dashboard.
+  ('owner_email',   'alexander.flores1030@gmail.com')
 on conflict (key) do nothing;
 
 -- ---------------------------------------------------------------------------
@@ -866,6 +868,70 @@ end
 $$;
 
 -- ---------------------------------------------------------------------------
+-- Owner dashboard: totals, daily charts and every wishlist. Only the sign-in email in
+-- app_settings.owner_email can call these (checked inside the function, not just in the website).
+-- ---------------------------------------------------------------------------
+create or replace function public.is_owner()
+returns boolean
+language sql stable security definer
+set search_path = public, pg_temp
+as $$
+  select public.me() is not null
+     and exists (select 1 from public.app_settings
+                 where key = 'owner_email' and value like '%@%' and lower(trim(value)) = public.me())
+$$;
+
+create or replace function public.owner_dashboard(p_days int default 30)
+returns jsonb
+language plpgsql stable security definer
+set search_path = public, pg_temp
+as $$
+declare
+  v_days  int := least(greatest(coalesce(p_days, 30), 7), 365);
+  v_today date := public.today_local();
+  v_out   jsonb;
+begin
+  if not public.is_owner() then
+    raise exception 'Not allowed';
+  end if;
+  with
+  firsts as (   -- when each list was started: its first item
+    select group_id, owner, min(created_at) as started from public.wish_items group by group_id, owner
+  ),
+  days as (select d::date as day from generate_series(v_today - (v_days - 1), v_today, interval '1 day') d),
+  u as (select (created_at at time zone (select value from public.app_settings where key = 'timezone'))::date as day, count(*) n from public.profiles where email not like '%@lists.invalid' group by 1),
+  g as (select (created_at at time zone (select value from public.app_settings where key = 'timezone'))::date as day, count(*) n from public.groups group by 1),
+  l as (select (started at time zone (select value from public.app_settings where key = 'timezone'))::date as day, count(*) n from firsts group by 1)
+  select jsonb_build_object(
+    'totals', jsonb_build_object(
+      'users',      (select count(*) from public.profiles where email not like '%@lists.invalid'),
+      'groups',     (select count(*) from public.groups where kind = 'group'),
+      'wishlists',  (select count(*) from public.groups where kind = 'registry'),
+      'lists',      (select count(*) from firsts),
+      'lists_shared', (select count(*) from public.wish_lists where submitted_at is not null),
+      'items',      (select count(*) from public.wish_items),
+      'purchases',  (select count(*) from public.claims)),
+    'daily', coalesce((select jsonb_agg(jsonb_build_object(
+        'day', days.day, 'users', coalesce(u.n, 0), 'groups', coalesce(g.n, 0), 'lists', coalesce(l.n, 0)) order by days.day)
+      from days left join u using (day) left join g using (day) left join l using (day)), '[]'::jsonb),
+    'lists', coalesce((select jsonb_agg(x order by x.started desc nulls last) from (
+        select gr.name as group_name, gr.kind, gr.event_date, gr.archived_at is not null as archived,
+               o.name as owner_name, m.is_recipient as for_someone_else, mb.name as managed_by,
+               (select count(*) from public.wish_items i where i.group_id = wl.group_id and i.owner = wl.owner) as items,
+               wl.submitted_at is not null as shared, f.started
+          from public.wish_lists wl
+          join public.groups gr on gr.id = wl.group_id
+          join public.group_members m on m.group_id = wl.group_id and m.member_id = wl.owner
+          join public.profiles o on o.id = wl.owner
+          left join public.profiles mb on mb.id = m.managed_by
+          left join firsts f on f.group_id = wl.group_id and f.owner = wl.owner
+         limit 1000) x), '[]'::jsonb)
+  ) into v_out;
+  return v_out;
+end
+$$;
+
+-- ---------------------------------------------------------------------------
 -- Access rules (row level security). This is what keeps claims hidden from
 -- the person whose list they are on: the database itself refuses to return them.
 -- ---------------------------------------------------------------------------
@@ -1081,7 +1147,8 @@ grant execute on function
   public.join_group(text), public.generate_invite(uuid), public.set_group_archived(uuid, boolean), public.submit_list(uuid),
   public.today_local(), public.sweep_archives(), public.edit_group(uuid, text, date), public.remove_member(uuid, uuid),
   public.can_edit_items(uuid, uuid), public.create_registry(text, date, text), public.add_list(uuid, text), public.rename_list(uuid, uuid, text),
-  public.add_child_list(uuid, text), public.delete_child_list(uuid, uuid), public.announce_child_list(uuid, uuid)
+  public.add_child_list(uuid, text), public.delete_child_list(uuid, uuid), public.announce_child_list(uuid, uuid),
+  public.is_owner(), public.owner_dashboard(int)
   to authenticated;
 grant execute on function public.preview_invite(text) to anon, authenticated;
 
