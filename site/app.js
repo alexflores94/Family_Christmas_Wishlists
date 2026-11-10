@@ -1747,7 +1747,8 @@ function memberView(member) {
   wrap.append(h("div", { class: "who-head" }, avatar(member, "lg"),
     h("div", null, h("h2", { text: possessive(member) + " list" }), h("p", { class: "muted", text: plural(items.length, "wish", "wishes") })),
     canEdit ? h("button", { class: "btn sm", type: "button", id: "edit-list", style: "margin-left:auto", onclick: function () { setView("edit:" + member); } }, "Edit list") : null));
-  wrap.append(aboutCard(member));
+  var ab = aboutCard(member);
+  if (ab) wrap.append(ab);
   wrap.append(h("div", { class: "card" },
     h("div", { class: "prog-row" }, h("span", { text: "Purchased" }), h("span", { text: bought + " of " + items.length })),
     h("div", { class: "progress" }, h("b", { style: "width:" + Math.round(bought / items.length * 100) + "%" }))));
