@@ -777,6 +777,7 @@ function renderMain() {
   var root = h("div", { class: "panel" }, topBar("Gifts, together", null));
   root.append(ui.confirmRow);
   if (route.name === "new") root.append(newGroupView());
+  else if (route.name === "new-orbit") root.append(newOrbitView());
   else if (route.name === "new-wishlist") root.append(newWishlistView());
   else if (route.name === "admin" && isOwner) root.append(adminView());
   else if (route.name === "admin-group" && isOwner) root.append(adminGroupView());
@@ -792,12 +793,11 @@ function dashboardView() {
   var showing = dashTab === "archived" ? archived : active;
   var wrap = h("div", { class: "panel" });
   wrap.append(h("div", { class: "dash-head" },
-    h("div", { class: "page-head" }, h("h2", { text: "Your wish groups" }),
-      h("p", { class: "muted", text: dashTab === "archived" ? "Archived groups and wishlists are view-only. Nothing in them can be changed." : groups.length ? "Open a group to add your wishes or shop for the people in it." : "Make a group for family, friends or a gift swap, or a wishlist to share with family." })),
+    h("div", { class: "page-head" }, h("h2", { text: "Your wish orbits" }),
+      h("p", { class: "muted", text: dashTab === "archived" ? "Archived groups and wishlists are view-only. Nothing in them can be changed." : groups.length ? "Open a group to add your wishes or shop for the people in it." : "Start a new orbit: a group event for a gift swap, or a one-way wishlist to share with family." })),
     h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" },
       isOwner ? h("button", { class: "btn", type: "button", id: "open-admin", onclick: function () { route = { name: "admin" }; renderMain(); window.scrollTo({ top: 0 }); }, text: "Admin" }) : null,
-      h("button", { class: "btn", type: "button", id: "new-wishlist", onclick: function () { route = { name: "new-wishlist" }; renderMain(); window.scrollTo({ top: 0 }); } }, icon("plus"), "New wishlist"),
-      h("button", { class: "btn primary", type: "button", id: "new-group", onclick: function () { route = { name: "new" }; renderMain(); window.scrollTo({ top: 0 }); } }, icon("plus"), "New group"))));
+      h("button", { class: "btn primary", type: "button", id: "new-orbit", onclick: function () { route = { name: "new-orbit" }; renderMain(); window.scrollTo({ top: 0 }); } }, icon("plus"), "New orbit"))));
   function tab(id, key, text, n) {
     return h("button", { class: "tab", type: "button", role: "tab", id: id, "aria-selected": dashTab === key ? "true" : "false",
       onclick: function () { dashTab = key; renderMain(); } }, text, h("span", { class: "badge", text: String(n) }));
@@ -880,6 +880,7 @@ function adminView() {
     var r = await sb.rpc("owner_dashboard", { p_days: adminDays });
     if (r.error) { body.replaceChildren(h("p", { class: "err", role: "alert", text: "Couldn’t load the dashboard. Re-run the latest setup.sql in Supabase if you haven’t yet." })); return; }
     var d = r.data, t = d.totals;
+    if (!Array.isArray(d.groups)) { body.replaceChildren(h("p", { class: "err", role: "alert", id: "admin-old-db", text: "Your database has an older version of the Admin page. Paste the latest backend/setup.sql into the Supabase SQL Editor and run it, then refresh." })); return; }
     body.replaceChildren();
     var tiles = h("dl", { class: "stats", id: "admin-totals", style: "grid-template-columns:repeat(auto-fit,minmax(130px,1fr))" });
     [["People", t.users, "a-users"], ["Groups", t.groups, "a-groups"], ["Wishlists", t.wishlists, "a-wishlists"], ["Lists started", t.lists, "a-lists"],
@@ -1003,11 +1004,29 @@ function newWishlistView() {
 }
 
 /* create a group */
+/* choose what kind of orbit to start */
+function newOrbitView() {
+  function option(id, title, text, to) {
+    return h("button", { class: "tag gcard", type: "button", id: id, style: "display:block;width:100%;text-align:left;margin-bottom:10px",
+      onclick: function () { route = { name: to }; renderMain(); window.scrollTo({ top: 0 }); } },
+      h("h3", { text: title }), h("p", { class: "muted", style: "margin:4px 0 0", text: text }));
+  }
+  return h("div", { class: "card item", id: "orbit-choose" },
+    h("div", { class: "page-head" }, h("h2", { text: "New orbit" }), h("p", { class: "muted", text: "What kind of orbit do you want to start?" })),
+    option("pick-group", "Group event", "Everyone in the group makes their own wishlist, and everyone can shop from each other’s lists. Good for family Christmas, friends or a gift swap.", "new"),
+    option("pick-wishlist", "One-way wishlist", "You write the lists, like a birthday or Christmas list for your kids. People with your link can view them and pick gifts, but can’t make lists of their own.", "new-wishlist"),
+    h("button", { class: "btn ghost", type: "button", id: "orbit-cancel", onclick: function () { route = { name: "dashboard" }; renderMain(); }, text: "Cancel" }));
+}
+
 function newGroupView() {
   var f = { name: "", date: "", min: "3" };
   var err = h("p", { class: "err", hidden: true, role: "alert", id: "g-err" });
   var btn = h("button", { class: "btn primary", type: "submit", id: "g-create", text: "Create group" });
   var form = h("form", { class: "card item", id: "g-form", novalidate: true },
+    h("div", { class: "page-head" }, h("h2", { text: "New group event" })),
+    h("div", { class: "card", id: "g-how", style: "padding:10px 12px;margin-bottom:12px" },
+      h("strong", { text: "How sharing works" }),
+      h("p", { class: "muted", style: "margin:4px 0 0;font-size:14px", text: "You get an invite link to send around. Everyone who joins writes their own wishlist and shares it when it’s ready. Once shared, the whole group can see it and mark gifts as purchased. The person the list belongs to never sees who bought what, so gifts stay a surprise. Members can also make lists for others, like their kids." })),
     h("div", { class: "field" }, h("label", { for: "g-name", text: "Group name" }),
       h("input", { id: "g-name", type: "text", maxlength: "60", placeholder: "Family Christmas, Office swap…", autocomplete: "off", oninput: function (e) { f.name = e.target.value; } })),
     h("div", { class: "field" }, h("label", { for: "g-date", text: "Event date" }),
