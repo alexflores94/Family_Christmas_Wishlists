@@ -14,7 +14,7 @@ var showLanding = true;           // signed-out visitors see the About page firs
 var authStep = "email";         // email | code
 var authEmail = "", authCode = "", authMsg = "", authDetail = "", authBusy = false;
 var loadDetail = "";
-var myEmail = null, myId = null, myName = "";   // myId is only ever shown back to its owner
+var myEmail = null, myId = null, myName = "", myLast = "";   // myId is only ever shown back to its owner
 var dashTab = "active";          // active | archived
 var joinCode = "", joinInfo = null, joinChecked = false;   // from an invite link (?join=CODE)
 var groups = [], groupsSig = "";
@@ -68,6 +68,8 @@ function nameOf(id) {
   if (id === myId && myName) return myName;
   return "Someone";
 }
+// Ends a sentence without doubling a period after a last initial ("Maria F.").
+function stop(t) { return /\.$/.test(t) ? t : t + "."; }
 function possessive(id) { return nameOf(id) + "’s"; }
 function colorIndex(id) {
   var n = 0; for (var i = 0; i < id.length; i++) n = (n * 31 + id.charCodeAt(i)) >>> 0;
@@ -121,7 +123,7 @@ function fmtMoney(cents) {
 function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
 function humanize(err) {
   var m = (err && err.message) || "";
-  if (/at least \d+ items|archived|only the group admin|not valid any more|can.t remove yourself|not in this group|reopen it|has passed|has already passed|person the list is for|event name|wishlist|up to 50 lists|not in this wishlist|not yours to change|up to 20 lists|can only be added|add your name|already been fully claimed|group name|item minimum|event date|name up to/i.test(m)) return m.replace(/^ERROR:\s*/, "");
+  if (/at least \d+ items|archived|only the group admin|not valid any more|can.t remove yourself|not in this group|reopen it|has passed|has already passed|person the list is for|event name|wishlist|up to 50 lists|not in this wishlist|not yours to change|up to 20 lists|can only be added|add your name|already been fully claimed|group name|item minimum|event date|name up to|first and last name/i.test(m)) return m.replace(/^ERROR:\s*/, "");
   if (/jwt|expired|not authenticated/i.test(m)) return "You were signed out. Sign in again to keep going.";
   if (/fetch|network|failed to/i.test(m)) return "Couldn’t reach the server. Check your connection and try again.";
   if (/row-level security|permission denied/i.test(m)) return "That isn’t allowed. The group may have been archived.";
@@ -160,7 +162,7 @@ async function loadGroup() {
   var id = route.id;
   var res = await Promise.all([
     sb.from("group_members").select("member_id,is_recipient,managed_by").eq("group_id", id),
-    sb.from("profiles").select("id,name"),
+    sb.from("profiles").select("id,name,last_initial"),
     sb.from("wish_lists").select("owner,submitted_at").eq("group_id", id),
     sb.from("wish_items").select("id,owner,name,description,link,image_url,price,price_as_of,quantity,position,created_at").eq("group_id", id).order("position").order("created_at"),
     sb.from("claims").select("item_id,buyer"),
@@ -172,8 +174,9 @@ async function loadGroup() {
     sb.from("santa_assignments").select("receiver").eq("group_id", id)
   ]);
   // the newer tables may not exist until setup.sql has been re-run: treat them as empty rather than failing
+  if (res[1].error) res[1] = await sb.from("profiles").select("id,name");   // database not upgraded yet: no last initials
   for (var i = 0; i < 8; i++) if (res[i].error) throw res[i].error;
-  var names = new Map((res[1].data || []).map(function (p) { return [p.id, p.name]; }));
+  var names = groupNames(res[1].data || [], (res[0].data || []).map(function (m) { return m.member_id; }));
   var byName = function (a, b) { return (names.get(a) || a).localeCompare(names.get(b) || b); };
   var allIds = (res[0].data || []).map(function (m) { return m.member_id; }).sort(byName);
   var recipients = new Set((res[0].data || []).filter(function (m) { return m.is_recipient; }).map(function (m) { return m.member_id; }));
@@ -212,6 +215,19 @@ async function loadGroup() {
   lastDataSig = s;
   gd = next;
   return changed;
+}
+// First names only. When two people in this group share a first name, each gets their last initial ("Maria F.").
+function groupNames(profiles, memberIds) {
+  var inGroup = new Set(memberIds), counts = new Map();
+  profiles.forEach(function (p) {
+    if (!inGroup.has(p.id)) return;
+    var k = (p.name || "").trim().toLowerCase();
+    counts.set(k, (counts.get(k) || 0) + 1);
+  });
+  return new Map(profiles.map(function (p) {
+    var n = (p.name || "").trim(), clash = inGroup.has(p.id) && counts.get(n.toLowerCase()) > 1;
+    return [p.id, clash && p.last_initial ? n + " " + p.last_initial + "." : n];
+  }));
 }
 function nameOf2(names, id) { return names.get(id) || ""; }
 
@@ -283,7 +299,7 @@ async function signOut() {
   render();
 }
 function resetSession() {
-  session = null; myEmail = null; myId = null; myName = ""; groups = []; groupsSig = ""; gd = null;
+  session = null; myEmail = null; myId = null; myName = ""; myLast = ""; groups = []; groupsSig = ""; gd = null;
   editor = null; route = { name: "dashboard" }; lastDataSig = "";
 }
 
@@ -305,7 +321,8 @@ async function enter() {
     var prof = await api(sb.rpc("my_profile"));
     myId = prof && prof[0] ? prof[0].id : null;
     myName = prof && prof[0] ? prof[0].name : "";
-    if (!myName) { phase = "name"; render(); return; }
+    myLast = prof && prof[0] ? prof[0].last_name || "" : "";
+    if (!myName || !myLast) { phase = "name"; render(); return; }
     await loadGroups();
     editor = null; gd = null;
     route = joinCode ? { name: "join" } : { name: "dashboard" };
@@ -710,13 +727,16 @@ function render() {
   renderMain();
 }
 function topBar(eyebrow, countdown, title) {
-  var chip = h("button", { class: "me-chip", type: "button", id: "me-chip", "aria-label": "Account menu for " + (myName || "you"), onclick: function () { ui.confirmRow.hidden = !ui.confirmRow.hidden; } },
+  var chip = h("button", { class: "me-chip", type: "button", id: "me-chip", "aria-label": "Account menu for " + (myName || "you"), onclick: function () { ui.confirmRow.hidden = !ui.confirmRow.hidden; if (ui.confirmRow.hidden) ui.nameForm.hidden = true; } },
     avatar(myId, "sm"), h("span", { class: "nm", text: myName || "Me" }));
   ui.confirmRow = h("div", { class: "confirm", hidden: true },
     h("span", { text: "Signed in as " + ((session && session.user && session.user.email) || myEmail || "you") + "." }),
+    h("button", { class: "btn sm", type: "button", id: "change-name", onclick: function () {
+      ui.nameForm.hidden = !ui.nameForm.hidden; if (!ui.nameForm.hidden) ui.nameFirst.focus(); }, text: "Change name" }),
     h("button", { class: "btn sm", type: "button", id: "send-feedback", onclick: openFeedback, text: "Send feedback" }),
     h("button", { class: "btn sm primary", type: "button", id: "sign-out", onclick: signOut, text: "Sign out" }),
-    h("button", { class: "btn sm ghost", type: "button", onclick: function () { ui.confirmRow.hidden = true; }, text: "Close" }));
+    h("button", { class: "btn sm ghost", type: "button", onclick: function () { ui.confirmRow.hidden = true; ui.nameForm.hidden = true; }, text: "Close" }));
+  ui.confirmRow.append(accountNameForm());
   var top = h("div", { class: "top" },
     h("div", { class: "brand" }, title ? null : h("span", { class: "eyebrow", text: eyebrow }), h("h1", { text: title || "Wish Orbit" })),
     h("div", { class: "top-right" }, countdown ? h("span", { class: "countdown", text: countdown }) : null, chip));
@@ -849,29 +869,79 @@ function landingView() {
   return wrap;
 }
 
-/* first sign-in: choose a display name */
+/* first sign-in: first and last name (both required) */
+function nameFields(prefix) {
+  var first = h("input", { id: prefix + "-first", type: "text", maxlength: "40", autocomplete: "given-name", value: myName || "" });
+  var last = h("input", { id: prefix + "-last", type: "text", maxlength: "40", autocomplete: "family-name", value: myLast || "" });
+  var row = h("div", { class: "name-row" },
+    h("div", { class: "field" }, h("label", { for: prefix + "-first", text: "First name" }), first),
+    h("div", { class: "field" }, h("label", { for: prefix + "-last", text: "Last name" }), last));
+  return { row: row, first: first, last: last };
+}
+// Saves both names. Returns "" on success, or a message to show.
+async function saveMyName(first, last) {
+  first = first.replace(/\s+/g, " ").trim(); last = last.replace(/\s+/g, " ").trim();
+  if (!first || !last) return "Enter both your first and last name.";
+  try { await api(sb.rpc("set_my_name", { p_first: first, p_last: last })); }
+  catch (err) { return humanize(err); }
+  myName = first; myLast = last;
+  return "";
+}
+var NAME_HINT = "People in your groups see your first name. If someone else in a group has the same first name, the first letter of your last name is added.";
 function nameView() {
-  var val = "", msg = h("p", { class: "err", hidden: true, role: "alert" });
-  var input = h("input", { id: "name-input", type: "text", maxlength: "40", autocomplete: "given-name", placeholder: "Your first name", oninput: function (e) { val = e.target.value; } });
+  var f = nameFields("name");
+  var msg = h("p", { class: "err", hidden: true, role: "alert" });
   var btn = h("button", { class: "btn primary", type: "submit", id: "name-go", text: "Continue" });
   var form = h("form", { class: "card item", id: "name-form", novalidate: true },
-    h("div", { class: "field" }, h("label", { for: "name-input", text: "Your name" }), input, msg), btn);
+    f.row, msg, h("p", { class: "muted", style: "font-size:14px", text: NAME_HINT }), h("div", null, btn));
   form.addEventListener("submit", async function (e) {
     e.preventDefault();
-    if (!val.trim()) { msg.textContent = "Enter the name your group will see."; msg.hidden = false; return; }
-    btn.disabled = true; btn.textContent = "One moment…";
-    try {
-      await api(sb.rpc("set_profile", { p_name: val.trim() }));
-      myName = val.trim();
-      await enter();
-    } catch (err) { msg.textContent = humanize(err); msg.hidden = false; btn.disabled = false; btn.textContent = "Continue"; }
+    btn.disabled = true; btn.textContent = "One moment…"; msg.hidden = true;
+    var err = await saveMyName(f.first.value, f.last.value);
+    if (err) { msg.textContent = err; msg.hidden = false; btn.disabled = false; btn.textContent = "Continue"; return; }
+    await enter();
   });
   var joining = joinCode && joinInfo;
-  setTimeout(function () { input.focus(); }, 0);
+  setTimeout(function () { (myName ? f.last : f.first).focus(); }, 0);
   return h("div", { class: "panel" },
-    heroView("Welcome! What should we call you?", (joining ? "You’re joining " + joinInfo.group_name + ". " : "") + "This is the name other people in your groups will see.", "One quick thing"),
+    heroView("Welcome! What’s your name?", (joining ? "You’re joining " + joinInfo.group_name + ". " : "") + "Enter your first and last name.", "One quick thing"),
     form,
     h("div", null, h("button", { class: "btn ghost", type: "button", onclick: signOut, text: "Sign out" })));
+}
+
+/* account menu: change your name */
+function accountNameForm() {
+  var f = nameFields("acct");
+  var err = h("p", { class: "err", role: "alert", hidden: true });
+  var save = h("button", { class: "btn sm primary", type: "submit", id: "acct-save", text: "Save name" });
+  var form = h("form", { class: "name-form", id: "acct-name-form", novalidate: true, hidden: true },
+    f.row, err, h("p", { class: "muted", style: "font-size:13px", text: NAME_HINT }),
+    h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" }, save,
+      h("button", { class: "btn sm ghost", type: "button", text: "Cancel", onclick: function () {
+        f.first.value = myName; f.last.value = myLast; err.hidden = true; form.hidden = true; } })));
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    save.disabled = true; save.textContent = "Saving…"; err.hidden = true;
+    var msg = await saveMyName(f.first.value, f.last.value);
+    save.disabled = false; save.textContent = "Save name";
+    if (msg) { err.textContent = msg; err.hidden = false; return; }
+    form.hidden = true; ui.confirmRow.hidden = true;
+    if (route.name === "group" && gd) {
+      try { await loadGroup(); } catch (x) { /* the next poll catches up */ }
+      updateTabs();
+      if (route.view !== "my" && route.view.indexOf("edit:") !== 0) renderPanel();
+    }
+    refreshChip();
+    toast("Name saved.");
+  });
+  ui.nameForm = form; ui.nameFirst = f.first;
+  return form;
+}
+function refreshChip() {
+  var chip = document.getElementById("me-chip");
+  if (!chip) return;
+  chip.replaceChildren(avatar(myId, "sm"), h("span", { class: "nm", text: myName || "Me" }));
+  chip.setAttribute("aria-label", "Account menu for " + (myName || "you"));
 }
 
 /* the signed-in shell */
@@ -1643,12 +1713,12 @@ function membersView() {
   var names = function (list) { return list.map(nameOf).join(", "); };
   if (toShop.length) {
     wrap.append(h("div", { class: "note warn", id: "shop-note" }, icon("lock"),
-      h("span", { text: "Still to shop for: " + names(toShop) + "." + (waiting.length ? " Waiting on a list from " + names(waiting) + "." : "") })));
+      h("span", { text: "Still to shop for: " + stop(names(toShop)) + (waiting.length ? " Waiting on a list from " + stop(names(waiting)) : "") })));
   } else if (mineBy.size) {
     wrap.append(h("div", { class: "note", id: "shop-note" }, icon("check"),
-      h("span", { text: "You’ve picked something from every shared list." + (waiting.length ? " Waiting on a list from " + names(waiting) + "." : "") })));
+      h("span", { text: "You’ve picked something from every shared list." + (waiting.length ? " Waiting on a list from " + stop(names(waiting)) : "") })));
   } else {
-    wrap.append(h("div", { class: "note", id: "shop-note" }, icon("lock"), h("span", { text: "No one has shared a list yet. Waiting on " + names(waiting) + "." })));
+    wrap.append(h("div", { class: "note", id: "shop-note" }, icon("lock"), h("span", { text: "No one has shared a list yet. Waiting on " + stop(names(waiting)) })));
   }
   var grid = h("div", { class: "grid" });
   others.forEach(function (m) {
@@ -1813,7 +1883,7 @@ function santaDrawCard() {
     return card;
   }
   if (isArchived()) { card.append(h("p", { class: "muted", text: "This group is archived, so the names can no longer be drawn." })); return card; }
-  card.append(h("p", { class: "muted", text: plural(shared.length, "player has", "players have") + " shared a list" + (waiting.length ? ". Still waiting on " + waiting.map(nameOf).join(", ") + "." : ".") }),
+  card.append(h("p", { class: "muted", text: plural(shared.length, "player has", "players have") + " shared a list" + (waiting.length ? ". Still waiting on " + stop(waiting.map(nameOf).join(", ")) : ".") }),
     h("p", { class: "muted", style: "font-size:13px", text: "You need at least 3 players with shared lists. Only players who have shared a list are part of the draw." }),
     h("button", { class: "btn primary", type: "button", id: "draw-start", disabled: shared.length < 3 ? true : null, onclick: function () { setView("draw"); }, text: "Assign Secret Santas" }));
   return card;

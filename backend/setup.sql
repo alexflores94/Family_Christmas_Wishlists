@@ -59,6 +59,13 @@ create table if not exists public.profiles (
   name       text not null check (length(trim(name)) between 1 and 40),
   created_at timestamptz not null default now()
 );
+-- People who sign in give a first name (kept in "name") and a last name. Others in a group only ever
+-- see the last initial, and only when two people in that group share a first name.
+-- Lists made for someone else (a child, say) have no last name.
+alter table public.profiles add column if not exists last_name text
+  check (last_name is null or length(trim(last_name)) between 1 and 40);
+alter table public.profiles add column if not exists last_initial text
+  generated always as (upper(left(nullif(btrim(last_name), ''), 1))) stored;
 
 create table if not exists public.groups (
   id          uuid primary key default gen_random_uuid(),
@@ -248,12 +255,30 @@ as $$
   select id from public.profiles where email = public.me()
 $$;
 
+drop function if exists public.my_profile();
 create or replace function public.my_profile()
-returns table (id uuid, name text)
+returns table (id uuid, name text, last_name text)
 language sql stable security definer
 set search_path = public, pg_temp
 as $$
-  select p.id, p.name from public.profiles p where p.email = public.me()
+  select p.id, p.name, p.last_name from public.profiles p where p.email = public.me()
+$$;
+
+-- How a person appears inside one group: their first name, plus their last initial when someone
+-- else in that group has the same first name.
+create or replace function public.group_name_of(p_group uuid, p_id uuid)
+returns text
+language sql stable security definer
+set search_path = public, pg_temp
+as $$
+  select case
+    when p.last_initial is not null and exists (
+      select 1 from public.group_members gm join public.profiles o on o.id = gm.member_id
+       where gm.group_id = p_group and o.id <> p.id and lower(btrim(o.name)) = lower(btrim(p.name)))
+    then p.name || ' ' || p.last_initial || '.'
+    else p.name
+  end
+  from public.profiles p where p.id = p_id
 $$;
 
 -- Today's date in the group time zone (app_settings.timezone), so an event on the 25th stays open all day on the 25th.
@@ -561,7 +586,7 @@ declare
   v_n     int;
   v_to    text[];
 begin
-  select name into v_who   from public.profiles where id = p_owner;
+  v_who := public.group_name_of(p_group, p_owner);
   select name, kind into v_group, v_kind from public.groups where id = p_group;
   select count(*) into v_n from public.wish_items where group_id = p_group and owner = p_owner;
   if v_kind = 'secret_santa' then
@@ -602,8 +627,8 @@ as $$
 declare
   v_author text; v_for text; v_group text; v_n int; v_to text[];
 begin
-  select name into v_author from public.profiles where id = p_author;
-  select name into v_for    from public.profiles where id = p_member;
+  v_author := public.group_name_of(p_group, p_author);
+  v_for    := public.group_name_of(p_group, p_member);
   select name into v_group  from public.groups   where id = p_group;
   select count(*) into v_n from public.wish_items where group_id = p_group and owner = p_member;
   select array_agg(p.email order by p.email) into v_to
@@ -638,6 +663,25 @@ begin
   end if;
   insert into public.profiles (email, name) values (m, trim(p_name))
   on conflict (email) do update set name = excluded.name;
+end
+$$;
+
+-- Sets the signed-in person's first and last name. Both are required.
+create or replace function public.set_my_name(p_first text, p_last text)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare
+  m text := public.me();
+  f text := regexp_replace(btrim(coalesce(p_first, '')), '\s+', ' ', 'g');
+  l text := regexp_replace(btrim(coalesce(p_last, '')), '\s+', ' ', 'g');
+begin
+  if m is null then raise exception 'Not authenticated'; end if;
+  if f = '' or l = '' then raise exception 'Enter both your first and last name'; end if;
+  if length(f) > 40 or length(l) > 40 then raise exception 'Enter a name up to 40 characters'; end if;
+  insert into public.profiles (email, name, last_name) values (m, f, l)
+  on conflict (email) do update set name = excluded.name, last_name = excluded.last_name;
 end
 $$;
 
@@ -1096,7 +1140,7 @@ begin
 
   for i in 1 .. n loop
     select p.email into v_to from public.profiles p where p.id = ids[i];
-    select p.name  into v_name from public.profiles p where p.id = ids[i % n + 1];
+    v_name := public.group_name_of(p_group, ids[i % n + 1]);
     perform public.send_mail(
       array[v_to],
       'Your Secret Santa pick in ' || g.name,
@@ -1155,8 +1199,8 @@ begin
   if a + c + r = 0 and not coalesce(p_about, false) then return false; end if;
 
   select * into g from public.groups where id = p_group;
-  select name into v_for   from public.profiles where id = p_owner;
-  select name into v_actor from public.profiles where id = m;
+  v_for   := public.group_name_of(p_group, p_owner);
+  v_actor := public.group_name_of(p_group, m);
   if g.kind = 'secret_santa' then
     select array_agg(p.email) into v_to from public.santa_assignments sa join public.profiles p on p.id = sa.giver
      where sa.group_id = p_group and sa.receiver = p_owner;
@@ -1578,7 +1622,8 @@ grant usage on schema public to authenticated, anon;
 revoke all on all tables in schema public from anon, authenticated;
 grant select on public.groups, public.group_invites, public.group_members, public.wish_lists to authenticated;
 -- Signed-in users can read only the id and name of people they share a group with. Never the email.
-grant select (id, name) on public.profiles to authenticated;
+-- (last_initial, not the full last name, is what tells two people with the same first name apart.)
+grant select (id, name, last_initial) on public.profiles to authenticated;
 grant select, insert, update, delete on public.wish_items to authenticated;
 grant select, insert, delete on public.claims to authenticated;
 grant select, insert, update, delete on public.claim_prices to authenticated;
@@ -1590,7 +1635,7 @@ revoke all on all functions in schema public from public, anon, authenticated;
 grant execute on function
   public.me(), public.my_id(), public.my_profile(), public.is_member(uuid), public.is_admin(uuid), public.group_open(uuid),
   public.list_submitted(uuid, uuid), public.wish_owner(uuid), public.item_group(uuid), public.shares_group(uuid),
-  public.set_profile(text), public.create_group(text, date, int), public.my_groups(),
+  public.set_profile(text), public.set_my_name(text, text), public.create_group(text, date, int), public.my_groups(),
   public.join_group(text), public.generate_invite(uuid), public.set_group_archived(uuid, boolean), public.submit_list(uuid),
   public.today_local(), public.sweep_archives(), public.edit_group(uuid, text, date), public.remove_member(uuid, uuid),
   public.can_edit_items(uuid, uuid), public.create_registry(text, date, text), public.add_list(uuid, text), public.rename_list(uuid, uuid, text),
