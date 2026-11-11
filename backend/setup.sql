@@ -28,7 +28,7 @@ $guard$;
 
 -- ---------------------------------------------------------------------------
 -- EDIT ME (first-time install only). Re-running never overwrites these once set.
---   site_url      the address of the published website, e.g. https://floreswishlists.vercel.app/
+--   site_url      the address of the published website, e.g. https://wishorbit.vercel.app/
 --   mailer_url    the web app address you get from the Google Apps Script step
 --   mailer_secret the same secret you typed into that script
 -- To change one later:  update public.app_settings set value = '...' where key = '...';

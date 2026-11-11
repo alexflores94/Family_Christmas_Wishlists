@@ -98,7 +98,7 @@ Gmail's free limit is roughly 100 recipients a day, far more than this site uses
 ## Step 4. Set up the database
 
 1. In `backend/setup.sql`, find the block marked **EDIT ME** and replace its three settings:
-   - `site_url`: your site's address, such as `https://floreswishlists.vercel.app/`
+   - `site_url`: your site's address, such as `https://wishorbit.vercel.app/`
    - `mailer_url`: the Apps Script web app URL from Step 3
    - `mailer_secret`: the same secret string you put in the script
 2. In Supabase open **SQL Editor > New query**, paste the whole edited file, and click **Run**. You should see "Success". If it complains about `pg_net`, open **Database > Extensions**, switch it on, and run it again.
@@ -118,7 +118,7 @@ Keep a copy with your real secret on your own computer, not in this repo.
 In Supabase SQL Editor run this, using your real address:
 
 ```sql
-update public.app_settings set value = 'https://floreswishlists.vercel.app/' where key = 'site_url';
+update public.app_settings set value = 'https://wishorbit.vercel.app/' where key = 'site_url';
 ```
 
 The emails use it for their "Open the wishlist" button.
