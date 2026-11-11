@@ -2106,7 +2106,7 @@ function manageView() {
     var row = h("div", { class: "person", "data-member": nameOf(m) }, avatar(m, "sm"),
       h("span", { class: "pn", text: nameOf(m) + (m === myId ? " (you)" : "") }),
       m === myId ? h("span", { class: "chip gold", text: "Admin" }) : null,
-      reg ? null : listFor(m).state === "ready" ? h("span", { class: "chip", text: "List shared" }) : h("span", { class: "chip grey", text: "No list yet" }));
+      reg ? null : (isSanta() ? santaShared(m) : listFor(m).state === "ready") ? h("span", { class: "chip", text: "List shared" }) : h("span", { class: "chip grey", text: "No list yet" }));
     if (m !== myId) {
       var rm = h("button", { class: "btn sm danger rm-btn", type: "button", text: "Remove", "aria-label": "Remove " + nameOf(m),
         disabled: frozen ? true : null, title: frozen ? "This group is archived" : null });
