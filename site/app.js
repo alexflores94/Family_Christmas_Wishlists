@@ -123,7 +123,7 @@ function fmtMoney(cents) {
 function plural(n, one, many) { return n + " " + (n === 1 ? one : many); }
 function humanize(err) {
   var m = (err && err.message) || "";
-  if (/at least \d+ items|archived|only the group admin|not valid any more|can.t remove yourself|not in this group|reopen it|has passed|has already passed|person the list is for|event name|wishlist|up to 50 lists|not in this wishlist|not yours to change|up to 20 lists|can only be added|add your name|already been fully claimed|group name|item minimum|event date|name up to|first and last name/i.test(m)) return m.replace(/^ERROR:\s*/, "");
+  if (/at least \d+ items|archived|only the group admin|not valid any more|can.t remove yourself|not in this group|reopen it|has passed|has already passed|person the list is for|event name|wishlist|up to 50 lists|not in this wishlist|not yours to change|up to 20 lists|can only be added|add your name|already been fully claimed|group name|item minimum|event date|name up to|first and last name|item name|up to 300 characters|between 1 and 99|up to 200 items|added this item|more of that item|already covered|signed up for|not in this sign-up|not on this sign-up/i.test(m)) return m.replace(/^ERROR:\s*/, "");
   if (/jwt|expired|not authenticated/i.test(m)) return "You were signed out. Sign in again to keep going.";
   if (/fetch|network|failed to/i.test(m)) return "Couldn’t reach the server. Check your connection and try again.";
   if (/row-level security|permission denied/i.test(m)) return "That isn’t allowed. The group may have been archived.";
@@ -148,6 +148,7 @@ function isAdmin() { var g = groupInfo(); return !!(g && g.is_admin); }
 function isSanta() { var g = groupInfo(); return !!(g && g.kind === "secret_santa"); }
 function isDrawn() { var g = groupInfo(); return !!(g && g.drawn); }
 function isRegistry() { var g = groupInfo(); return !!(g && g.kind === "registry"); }   // a one-way wishlist
+function isSignup() { var g = groupInfo(); return !!(g && g.kind === "signup"); }       // an event sign-up list
 
 async function loadGroups() {
   // Groups whose event date has passed archive themselves; do it before reading so every screen agrees.
@@ -171,8 +172,11 @@ async function loadGroup() {
     sb.from("claim_details").select("item_id,note,tracking_url,arrived"),
     sb.from("list_about").select("owner,about").eq("group_id", id),
     sb.from("extra_purchases").select("id,recipient,name,link,price,note,tracking_url,arrived,created_at").eq("group_id", id).order("created_at"),
-    sb.from("santa_assignments").select("receiver").eq("group_id", id)
+    sb.from("santa_assignments").select("receiver").eq("group_id", id),
+    isSignup() ? sb.from("signup_items").select("id,name,description,quantity,position,added_by,created_at").eq("group_id", id).order("position").order("created_at") : Promise.resolve({ data: [] }),
+    isSignup() ? sb.from("signup_claims").select("item_id,member_id,amount,assigned_by,created_at").eq("group_id", id).order("created_at") : Promise.resolve({ data: [] })
   ]);
+  if (isSignup()) { if (res[11].error) throw res[11].error; if (res[12].error) throw res[12].error; }
   // the newer tables may not exist until setup.sql has been re-run: treat them as empty rather than failing
   if (res[1].error) res[1] = await sb.from("profiles").select("id,name");   // database not upgraded yet: no last initials
   for (var i = 0; i < 8; i++) if (res[i].error) throw res[i].error;
@@ -205,12 +209,13 @@ async function loadGroup() {
     listMeta: new Map((res[2].data || []).map(function (r) { return [r.owner, r]; })),
     extras: (res[9].data || []).map(function (x) { return { id: x.id, recipient: x.recipient, name: x.name, link: x.link || "", price: x.price === null ? null : Number(x.price), note: x.note || "", tracking_url: x.tracking_url || "", arrived: !!x.arrived }; }),
     assigned: (res[10].data && res[10].data[0] && res[10].data[0].receiver) || null,
+    su: suModel(res[11].data || [], res[12].data || []),
     about: new Map((res[8].data || []).map(function (r) { return [r.owner, r.about || ""]; })),
     items: items, claimers: claimers,
     code: (res[6].data && res[6].data[0] && res[6].data[0].code) || "",
     paid: new Map((res[5].data || []).filter(function (r) { return known.has(r.item_id); }).map(function (r) { return [r.item_id, Number(r.amount)]; }))
   };
-  var s = JSON.stringify([memberIds, allIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code, Array.from(next.paid), Array.from(next.details), Array.from(next.managedBy), Array.from(next.about), next.extras, next.assigned]);
+  var s = JSON.stringify([memberIds, allIds, Array.from(names), Array.from(next.listMeta), Array.from(items), Array.from(claimers), next.code, Array.from(next.paid), Array.from(next.details), Array.from(next.managedBy), Array.from(next.about), next.extras, next.assigned, res[11].data, res[12].data]);
   var changed = s !== lastDataSig;
   lastDataSig = s;
   gd = next;
@@ -324,6 +329,8 @@ async function enter() {
     myLast = prof && prof[0] ? prof[0].last_name || "" : "";
     if (!myName || !myLast) { phase = "name"; render(); return; }
     await loadGroups();
+    // Sends any sign-up list summaries that are due, in case the database's scheduled job isn't running.
+    try { sb.rpc("send_signup_summaries").then(function () {}, function () {}); } catch (e) { /* older database */ }
     editor = null; gd = null;
     route = joinCode ? { name: "join" } : { name: "dashboard" };
     phase = "ready";
@@ -362,7 +369,8 @@ async function poll() {
       var ch = await loadGroup();
       if (!ch && !gch) return;
       updateTabs();
-      var typing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#d-form, #lists-card, #new-list-form, .buyitem");
+      var typing = document.activeElement && document.activeElement.closest && document.activeElement.closest("#d-form, #lists-card, #new-list-form, .buyitem, .su-item, #su-add");
+      if (isSignup() && document.querySelector(".su-form:not([hidden])")) typing = true;   // an edit or assign form is open
       if (route.view !== "my" && route.view.indexOf("edit:") !== 0 && !typing) renderPanel();   // never rebuild the editor while someone is typing
     }
   } catch (e) { /* keep showing what we have; the next poll retries */ }
@@ -397,7 +405,7 @@ async function openGroup(id, view) {
     await loadGroups();
     if (!groupInfo()) { route = { name: "dashboard" }; renderMain(); toast("That group isn’t available."); return; }
     // Land on my list while it still needs filling out; once it's shared, start on everyone's lists.
-    if (!view) { var gi = groupInfo(); route.view = isRegistry() || (gi && gi.list_submitted) ? "members" : "my"; }
+    if (!view) { var gi = groupInfo(); route.view = isRegistry() || isSignup() || (gi && gi.list_submitted) ? "members" : "my"; }
     await loadGroup();
   } catch (e) { toast(humanize(e)); route = { name: "dashboard" }; renderMain(); return; }
   ui.loadingGroup = false;
@@ -994,6 +1002,7 @@ function renderMain() {
   else if (route.name === "new-santa") root.append(newGroupView("secret_santa"));
   else if (route.name === "new-orbit") root.append(newOrbitView());
   else if (route.name === "new-wishlist") root.append(newWishlistView());
+  else if (route.name === "new-signup") root.append(newSignupView());
   else if (route.name === "admin" && isOwner) root.append(adminView());
   else if (route.name === "admin-group" && isOwner) root.append(adminGroupView());
   else if (route.name === "join") root.append(joinView());
@@ -1030,14 +1039,18 @@ function dashboardView() {
   var grid = h("div", { class: "grid" });
   showing.forEach(function (g) {
     var d = daysUntil(g.event_date);
-    var left = g.kind === "secret_santa" ? (!g.drawn ? "Names not drawn yet" : g.left_to_shop === 0 ? "Gift bought" : "Gift to buy")
+    var su = g.kind === "signup";
+    var left = su ? (g.left_to_shop === 0 ? "Everything covered" : plural(g.left_to_shop, "item", "items")) : g.kind === "secret_santa" ? (!g.drawn ? "Names not drawn yet" : g.left_to_shop === 0 ? "Gift bought" : "Gift to buy")
       : g.kind !== "registry" && g.member_count <= 1 ? "Just you so far" : g.left_to_shop === 0 ? "All shopped for" : g.left_to_shop + " to go";
     var chips = h("div", { class: "chips" });
     var isReg = g.kind === "registry";
     if (isReg) chips.append(h("span", { class: "chip", "data-chip": "wishlist", text: "Wishlist" }));
     if (g.kind === "secret_santa") chips.append(h("span", { class: "chip", "data-chip": "santa", text: "Secret Santa" }));
+    if (su) chips.append(h("span", { class: "chip", "data-chip": "signup", text: "Sign-up list" }));
     if (g.is_admin) chips.append(h("span", { class: "chip gold", text: "Admin" }));
     if (g.archived_at) chips.append(h("span", { class: "chip grey", text: "Archived" }));
+    else if (su && !g.list_submitted) chips.append(h("span", { class: "chip red", text: "You haven’t picked anything" }));
+    else if (su) chips.append(h("span", { class: "chip", text: "You’re bringing something" }));
     else if (!isReg && !g.list_submitted) chips.append(h("span", { class: "chip red", text: "Your list isn’t shared" }));
     grid.append(h("button", { class: "tag gcard" + (g.archived_at ? " archived" : ""), type: "button", "data-gid": g.group_id, "aria-label": "Open " + g.name, onclick: function () { openGroup(g.group_id); } },
       h("div", null, h("h3", { text: g.name })),
@@ -1047,7 +1060,7 @@ function dashboardView() {
         h("div", null, h("dt", { text: "Created by" }), h("dd", { class: "s-creator", text: g.admin_name || "—" })),
         h("div", null, h("dt", { text: "Created" }), h("dd", { class: "s-created", text: fmtDay(g.created_at) })),
         h("div", null, h("dt", { text: isReg ? "Lists" : g.kind === "secret_santa" ? "Players" : "Members" }), h("dd", { class: "s-members", text: String(g.member_count) })),
-        h("div", null, h("dt", { text: g.kind === "secret_santa" ? "Your pick" : "Left to shop for" }), h("dd", { class: "s-left", text: left })))));
+        h("div", null, h("dt", { text: su ? "Still needed" : g.kind === "secret_santa" ? "Your pick" : "Left to shop for" }), h("dd", { class: "s-left", text: left })))));
   });
   wrap.append(grid);
   return wrap;
@@ -1148,7 +1161,7 @@ function adminView() {
     var tiles = h("dl", { class: "stats", id: "admin-totals", style: "grid-template-columns:repeat(auto-fit,minmax(130px,1fr))" });
     [["People", t.users, "a-users"], ["Groups", t.groups, "a-groups"], ["Wishlists", t.wishlists, "a-wishlists"], ["Lists started", t.lists, "a-lists"],
      ["Lists shared", t.lists_shared, "a-shared"], ["Items", t.items, "a-items"], ["Gifts picked", t.purchases, "a-purchases"],
-     ["Secret Santas", t.santas || 0, "a-santas"], ["Open feedback", t.open_feedback || 0, "a-feedback"]].forEach(function (x) {
+     ["Secret Santas", t.santas || 0, "a-santas"], ["Sign-up lists", t.signups || 0, "a-signups"], ["Open feedback", t.open_feedback || 0, "a-feedback"]].forEach(function (x) {
       tiles.append(h("div", { class: "card", style: "padding:12px" }, h("dt", { text: x[0] }), h("dd", { id: x[2], style: "font-size:24px", text: String(x[1]) })));
     });
     body.append(tiles);
@@ -1205,7 +1218,7 @@ function adminGroupView() {
     body.replaceChildren(
       h("div", { class: "dash-head" },
         h("div", { class: "page-head" }, h("h2", { id: "ag-title", text: g.name }),
-          h("p", { class: "muted", text: (g.kind === "registry" ? "Wishlist" : g.kind === "secret_santa" ? "Secret Santa" + (g.drawn ? " (names drawn)" : "") : "Group") + " · " + g.members + " member" + (g.members === 1 ? "" : "s") + " · event " + fmtDay(g.event_date) + " · created " + fmtDay(g.created_at) + " by " + g.created_by + (g.archived ? " · archived" : "") })),
+          h("p", { class: "muted", text: (g.kind === "registry" ? "Wishlist" : g.kind === "signup" ? "Sign-up list" : g.kind === "secret_santa" ? "Secret Santa" + (g.drawn ? " (names drawn)" : "") : "Group") + " · " + g.members + " member" + (g.members === 1 ? "" : "s") + " · event " + fmtDay(g.event_date) + " · created " + fmtDay(g.created_at) + " by " + g.created_by + (g.archived ? " · archived" : "") })),
         back),
       h("div", { class: "card", id: "ag-banner", style: "padding:10px 12px;margin-bottom:12px" }, h("strong", { text: "Admin view, read only. " }), h("span", { class: "muted", text: "You can look at every list, but nothing here can be changed." })));
     if (!lists.length) body.append(h("p", { class: "muted", text: "No lists in this group yet." }));
@@ -1282,6 +1295,7 @@ function newOrbitView() {
     h("div", { class: "page-head" }, h("h2", { text: "New orbit" }), h("p", { class: "muted", text: "What kind of orbit do you want to start?" })),
     option("pick-group", "Group event", "Everyone in the group makes their own wishlist, and everyone can shop from each other’s lists. Good for family Christmas, friends or a gift swap.", "new"),
     option("pick-wishlist", "One-way wishlist", "You write the lists, like a birthday or Christmas list for your kids. People with your link can view them and pick gifts, but can’t make lists of their own.", "new-wishlist"),
+    option("pick-signup", "Event sign-up list", "List what your event needs, like dishes for Thanksgiving, and share the link. People claim what they’ll bring or add something new, so nothing gets doubled up. You can assign items too.", "new-signup"),
     option("pick-santa", "Secret Santa", "Everyone shares a list, then you draw names. Each person is given one list to buy from. Nobody can see anyone else’s list, and not even you will know who has whom.", "new-santa"),
     h("button", { class: "btn ghost", type: "button", id: "orbit-cancel", onclick: function () { route = { name: "dashboard" }; renderMain(); }, text: "Cancel" }));
 }
@@ -1343,8 +1357,8 @@ function joinView() {
   }
   var already = groups.find(function (g) { return g.name === joinInfo.group_name && g.event_date === joinInfo.event_date; });
   var err = h("p", { class: "err", hidden: true, role: "alert", id: "join-err" });
-  var wl = joinInfo.kind === "registry", ss = joinInfo.kind === "secret_santa";
-  var btn = h("button", { class: "btn primary", type: "button", id: "join-go", text: wl ? "Open wishlist" : ss ? "Join Secret Santa" : "Join group", disabled: (joinInfo.archived || joinInfo.drawn) && !already ? true : null });
+  var wl = joinInfo.kind === "registry", ss = joinInfo.kind === "secret_santa", su = joinInfo.kind === "signup";
+  var btn = h("button", { class: "btn primary", type: "button", id: "join-go", text: wl ? "Open wishlist" : ss ? "Join Secret Santa" : su ? "Join sign-up list" : "Join group", disabled: (joinInfo.archived || joinInfo.drawn) && !already ? true : null });
   btn.addEventListener("click", async function () {
     btn.disabled = true; btn.textContent = "Joining…";
     try {
@@ -1352,10 +1366,10 @@ function joinView() {
       finishJoinLink();
       await loadGroups();
       await openGroup(id);
-      toast(wl ? "You’re in! Open a list and mark gifts as purchased." : ss ? "You’re in! Write your list and share it when it’s ready." : "You’re in! Add your wishes whenever you’re ready.");
-    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = wl ? "Open wishlist" : ss ? "Join Secret Santa" : "Join group"; }
+      toast(wl ? "You’re in! Open a list and mark gifts as purchased." : su ? "You’re in! Pick what you’ll bring." : ss ? "You’re in! Write your list and share it when it’s ready." : "You’re in! Add your wishes whenever you’re ready.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = wl ? "Open wishlist" : ss ? "Join Secret Santa" : su ? "Join sign-up list" : "Join group"; }
   });
-  wrap.append(heroView((wl ? "Open " : "Join ") + joinInfo.group_name + "?", "You’re signed in as " + myEmail + ". You’ll sign in with this email whenever you come back." + (wl ? " You’ll be able to see the lists and mark gifts as purchased." : ""), "You’re invited"),
+  wrap.append(heroView((wl ? "Open " : "Join ") + joinInfo.group_name + "?", "You’re signed in as " + myEmail + ". You’ll sign in with this email whenever you come back." + (wl ? " You’ll be able to see the lists and mark gifts as purchased." : su ? " You’ll be able to see what’s needed and claim what you’ll bring." : ""), "You’re invited"),
     h("div", { class: "card" },
       h("dl", { class: "stats" },
         h("div", null, h("dt", { text: "Event date" }), h("dd", { text: fmtDay(joinInfo.event_date) })),
@@ -1374,13 +1388,13 @@ function groupShell() {
   var g = groupInfo();
   if (!g || !gd) return loadingView();
   var top = topBar(null, countdownText(g.event_date), g.name);
-  var reg = g.kind === "registry";
+  var reg = g.kind === "registry" || g.kind === "signup";
   ui.tabMy = reg ? null : h("button", { class: "tab", type: "button", role: "tab", id: "tab-my", onclick: function () { setView("my"); } });
   ui.tabFam = h("button", { class: "tab", type: "button", role: "tab", id: "tab-family", onclick: function () { setView("members"); } });
   ui.tabPur = h("button", { class: "tab", type: "button", role: "tab", id: "tab-purchases", onclick: function () { setView("purchases"); } });
   var tabList = reg ? [ui.tabFam, ui.tabPur] : g.list_submitted ? [ui.tabFam, ui.tabPur, ui.tabMy] : [ui.tabMy, ui.tabFam, ui.tabPur];
   if (g.is_admin) {
-    ui.tabManage = h("button", { class: "tab", type: "button", role: "tab", id: "tab-manage", onclick: function () { setView("manage"); } }, "Manage");
+    ui.tabManage = h("button", { class: "tab", type: "button", role: "tab", id: "tab-manage", onclick: function () { setView("manage"); } }, g.kind === "signup" ? "Host" : "Manage");
     tabList.push(ui.tabManage);
   }
   var tabs = h("div", { class: "tabs", role: "tablist" }, tabList);
@@ -1389,7 +1403,7 @@ function groupShell() {
   var back = h("button", { class: "btn ghost back", type: "button", id: "back-dash", onclick: goDashboard }, icon("back"), "All groups");
   var root = h("div", { class: "panel" }, top, ui.confirmRow, back, tabs, ui.panel);
   if (g.archived_at) root.insertBefore(h("div", { class: "note warn", id: "archived-note" }, icon("lock"),
-    h("span", { text: (reg ? "This wishlist" : "This group") + " is archived and view-only. No one can join, and nothing can be added, edited or marked as purchased." })), tabs);
+    h("span", { text: (g.kind === "signup" ? "This sign-up list" : reg ? "This wishlist" : "This group") + " is archived and view-only. No one can join, and nothing can be added, edited or marked as purchased." })), tabs);
   setTimeout(function () { renderPanel(); updateTabs(); }, 0);
   return root;
 }
@@ -1404,6 +1418,7 @@ function boughtCount() {
 function updateTabs() {
   if (!ui.tabFam || !gd) return;
   var v = route.view;
+  if (isSignup()) { suUpdateTabs(); return; }
   var reg = isRegistry();
   var onFam = v === "members" || v.indexOf("member:") === 0 || v.indexOf("edit:") === 0;
   if (ui.tabMy) ui.tabMy.setAttribute("aria-selected", v === "my" ? "true" : "false");
@@ -1439,6 +1454,11 @@ function renderPanel() {
   if (!ui.panel || !gd) return;
   ui.panel.replaceChildren();
   var v = route.view;
+  if (isSignup()) {
+    if (v !== "members" && v !== "purchases" && !(v === "manage" && isAdmin())) v = route.view = "members";
+    ui.panel.append(v === "purchases" ? suMineView() : v === "manage" ? manageView() : suListView());
+    return;
+  }
   if (isRegistry() && v === "my") v = route.view = "members";
   if (v.indexOf("edit:") === 0 && !canManageList(v.slice(5))) v = route.view = "members";
   if (v.indexOf("edit:") === 0 && isArchived()) v = route.view = "member:" + v.slice(5);
@@ -2128,7 +2148,7 @@ async function copyText(text, input) {
 function manageView() {
   var g = groupInfo();
   var wrap = h("div", { class: "panel" });
-  wrap.append(h("div", { class: "page-head" }, h("h2", { text: isSanta() ? "Host" : "Manage group" }),
+  wrap.append(h("div", { class: "page-head" }, h("h2", { text: isSanta() || isSignup() ? "Host" : "Manage group" }),
     h("p", { class: "muted", text: isSanta() ? "Only you, the host, can see this tab." : "Only you, the admin, can see this tab." })));
   if (isSanta()) wrap.append(santaDrawCard());
 
@@ -2137,7 +2157,7 @@ function manageView() {
   if (g.archived_at) {
     linkCard.append(h("p", { class: "muted", text: "This group is archived and view-only, so the invite link no longer lets anyone join. Reopen the group to use it again." }));
   } else {
-    linkCard.append(h("p", { class: "muted", text: g.kind === "registry" ? "Anyone with this link can view the lists and mark gifts as purchased after confirming their email. They can’t make lists of their own. Send it by text or email." : "Anyone with this link can join the group after confirming their email. Send it by text or email." }));
+    linkCard.append(h("p", { class: "muted", text: g.kind === "signup" ? "Anyone with this link can join after confirming their email, then claim what they’ll bring or add items. Send it by text or email." : g.kind === "registry" ? "Anyone with this link can view the lists and mark gifts as purchased after confirming their email. They can’t make lists of their own. Send it by text or email." : "Anyone with this link can join the group after confirming their email. Send it by text or email." }));
   }
   if (gd.code) {
     var input = h("input", { id: "invite-link", type: "text", readonly: true, disabled: g.archived_at ? true : null, value: inviteUrl(), "aria-label": "Invite link", onfocus: function (e) { e.target.select(); } });
@@ -2176,12 +2196,12 @@ function manageView() {
     var row = h("div", { class: "person", "data-member": nameOf(m) }, avatar(m, "sm"),
       h("span", { class: "pn", text: nameOf(m) + (m === myId ? " (you)" : "") }),
       m === myId ? h("span", { class: "chip gold", text: "Admin" }) : null,
-      reg ? null : (isSanta() ? santaShared(m) : listFor(m).state === "ready") ? h("span", { class: "chip", text: "List shared" }) : h("span", { class: "chip grey", text: "No list yet" }));
+      reg ? null : isSignup() ? suPersonChip(m) : (isSanta() ? santaShared(m) : listFor(m).state === "ready") ? h("span", { class: "chip", text: "List shared" }) : h("span", { class: "chip grey", text: "No list yet" }));
     if (m !== myId) {
       var rm = h("button", { class: "btn sm danger rm-btn", type: "button", text: "Remove", "aria-label": "Remove " + nameOf(m),
         disabled: frozen ? true : null, title: frozen ? "This group is archived" : null });
       var conf = h("div", { class: "confirm rm-confirm", hidden: true },
-        h("span", { text: "Remove " + nameOf(m) + "? Their list and everything they picked will be deleted. They can only come back with an invite link." }),
+        h("span", { text: "Remove " + nameOf(m) + "? " + (isSignup() ? "Everything they signed up to bring is released." : "Their list and everything they picked will be deleted.") + " They can only come back with an invite link." }),
         h("button", { class: "btn sm primary rm-yes", type: "button", text: "Yes, remove", onclick: function () { removeMember(m, conf); } }),
         h("button", { class: "btn sm ghost", type: "button", text: "Cancel", onclick: function () { conf.hidden = true; rm.hidden = false; } }));
       rm.addEventListener("click", function () { conf.hidden = false; rm.hidden = true; });
@@ -2196,9 +2216,9 @@ function manageView() {
   var settings = h("div", { class: "card stack", id: "archive-card" }, h("h3", { text: "Group settings" }),
     h("dl", { class: "stats" },
       h("div", null, h("dt", { text: "Event date" }), h("dd", { text: fmtDay(g.event_date) })),
-      h("div", null, h("dt", { text: "Minimum items" }), h("dd", { text: String(g.item_min) }))));
+      isSignup() ? null : h("div", null, h("dt", { text: "Minimum items" }), h("dd", { text: String(g.item_min) }))));
   if (!g.archived_at) {
-    settings.append(h("p", { class: "muted", text: "Archiving freezes the group. No one can join, add or edit lists, or mark purchases. People can still view everything, and the group moves to the Archived tab. You can reopen it later." }));
+    settings.append(h("p", { class: "muted", text: isSignup() ? "Archiving freezes the sign-up list. No one can join, claim or add items. People can still view everything, and it moves to the Archived tab. You can reopen it later." : "Archiving freezes the group. No one can join, add or edit lists, or mark purchases. People can still view everything, and the group moves to the Archived tab. You can reopen it later." }));
     var arch = h("button", { class: "btn danger", type: "button", id: "archive-btn", text: "Archive group" });
     var conf = h("div", { class: "confirm", id: "archive-confirm", hidden: true },
       h("span", { text: "Archive " + g.name + "?" }),
@@ -2223,7 +2243,7 @@ function detailsCard(g) {
   var err = h("p", { class: "err", hidden: true, role: "alert", id: "d-err" });
   var save = h("button", { class: "btn primary", type: "submit", id: "d-save", text: passed && g.archived_at ? "Save and reopen" : "Save changes", disabled: locked ? true : null });
   var form = h("form", { class: "stack", id: "d-form", novalidate: true },
-    h("div", { class: "field" }, h("label", { for: "d-name", text: g.kind === "registry" ? "Event name" : "Group name" }),
+    h("div", { class: "field" }, h("label", { for: "d-name", text: g.kind === "registry" || g.kind === "signup" ? "Event name" : "Group name" }),
       h("input", { id: "d-name", type: "text", maxlength: "60", value: f.name, disabled: locked ? true : null, autocomplete: "off", oninput: function (e) { f.name = e.target.value; } })),
     h("div", { class: "field" }, h("label", { for: "d-date", text: "Event date" }),
       h("input", { id: "d-date", type: "date", min: todayStr(), value: f.date, disabled: locked ? true : null, oninput: function (e) { f.date = e.target.value; } })),
@@ -2297,6 +2317,501 @@ async function setArchived(flag) {
     renderMain();
     toast(flag ? "Group archived. It now lives under Archived on your dashboard." : "Group reopened.");
   } catch (e) { toast(humanize(e)); }
+}
+
+/* ---------- event sign-up lists ---------- */
+// The dishes most Thanksgiving tables have. The host edits or deletes any of them before creating the list.
+var THANKSGIVING = [
+  ["Turkey", "Roasted, smoked or fried", 1],
+  ["Mashed potatoes", "", 1],
+  ["Gravy", "", 1],
+  ["Stuffing", "", 1],
+  ["Cranberry sauce", "", 1],
+  ["Green bean casserole", "", 1],
+  ["Sweet potato casserole", "", 1],
+  ["Mac and cheese", "", 1],
+  ["Dinner rolls", "About two dozen, with butter", 1],
+  ["Corn", "Corn casserole or corn on the cob", 1],
+  ["Salad", "", 1],
+  ["Deviled eggs", "", 1],
+  ["Pumpkin pie", "", 2],
+  ["Apple pie", "", 1],
+  ["Pecan pie", "", 1],
+  ["Whipped cream", "For the pies", 1],
+  ["Drinks", "Cider, soda or sparkling water", 2],
+  ["Ice", "", 1],
+  ["Plates, cups and napkins", "", 1]
+];
+function thanksgivingDay(year) {
+  var d = new Date(year, 10, 1);
+  var first = (4 - d.getDay() + 7) % 7;        // first Thursday of November
+  return new Date(year, 10, 1 + first + 21);   // the fourth one
+}
+function isoDay(d) { return d.getFullYear() + "-" + String(d.getMonth() + 1).padStart(2, "0") + "-" + String(d.getDate()).padStart(2, "0"); }
+
+function suModel(items, claims) {
+  var by = new Map();
+  claims.forEach(function (c) { if (!by.has(c.item_id)) by.set(c.item_id, []); by.get(c.item_id).push(c); });
+  return { items: items, claims: by };
+}
+function suClaims(it) { return gd.su.claims.get(it.id) || []; }
+function suTaken(it) { return suClaims(it).reduce(function (n, c) { return n + c.amount; }, 0); }
+function suLeft(it) { return Math.max(0, it.quantity - suTaken(it)); }
+function suMine(it) { return suClaims(it).find(function (c) { return c.member_id === myId; }) || null; }
+function suPeople() { return gd.everyone.filter(function (m) { return !gd.recipients.has(m); }); }
+function suCanEdit(it) { return !isArchived() && (isAdmin() || it.added_by === myId); }
+function suStats() {
+  var items = gd.su.items, need = 0, have = 0, covered = 0, mine = [];
+  items.forEach(function (it) {
+    var t = suTaken(it);
+    need += it.quantity; have += Math.min(t, it.quantity);
+    if (t >= it.quantity) covered++;
+    var c = suMine(it); if (c) mine.push({ item: it, claim: c });
+  });
+  return { items: items.length, need: need, have: have, covered: covered, open: items.length - covered, mine: mine };
+}
+function suItemsOf(m) { return gd.su.items.filter(function (it) { return suClaims(it).some(function (c) { return c.member_id === m; }); }); }
+function suPersonChip(m) {
+  var n = suItemsOf(m).length;
+  return n ? h("span", { class: "chip", text: "Bringing " + plural(n, "item", "items") }) : h("span", { class: "chip grey", text: "Nothing yet" });
+}
+function suUpdateTabs() {
+  var v = route.view, st = suStats();
+  ui.tabFam.setAttribute("aria-selected", v === "members" ? "true" : "false");
+  ui.tabPur.setAttribute("aria-selected", v === "purchases" ? "true" : "false");
+  if (ui.tabManage) ui.tabManage.setAttribute("aria-selected", v === "manage" ? "true" : "false");
+  ui.tabFam.replaceChildren(document.createTextNode("Sign-up list"), h("span", { class: "badge", title: st.covered + " of " + st.items + " items covered", text: st.covered + "/" + st.items }));
+  ui.tabPur.replaceChildren(document.createTextNode("My items"), h("span", { class: st.mine.length ? "badge" : "badge warn", text: String(st.mine.length) }));
+}
+function suClaimText(c) {
+  return nameOf(c.member_id) + (c.amount > 1 ? " ×" + c.amount : "") + (c.assigned_by && c.assigned_by !== c.member_id ? " (assigned)" : "");
+}
+function amountSelect(max, value, label, cls) {
+  var sel = h("select", { class: "su-amt " + (cls || ""), "aria-label": label });
+  for (var i = 1; i <= Math.max(1, Math.min(max, 99)); i++) sel.append(h("option", { value: String(i), selected: i === value ? true : null, text: String(i) }));
+  return sel;
+}
+// Runs a change, then refreshes the list. Buttons inside `el` are disabled meanwhile.
+async function suRun(el, fn, done) {
+  var btns = el ? el.querySelectorAll("button, select, input, textarea") : [];
+  btns.forEach(function (b) { b.disabled = true; });
+  try {
+    await fn();
+    await loadGroup();
+    renderPanel(); updateTabs();
+    if (done) toast(done);
+  } catch (e) {
+    toast(humanize(e));
+    btns.forEach(function (b) { b.disabled = false; });
+  }
+}
+
+/* creating a sign-up list */
+function newSignupView() {
+  var f = { name: "", date: "" };
+  var rows = [];
+  function row(name, description, qty) { return { key: rid(), name: name || "", description: description || "", qty: String(qty || 1) }; }
+  function hasContent() { return rows.some(function (r) { return r.name.trim() || r.description.trim(); }); }
+  rows.push(row(), row(), row());
+  var err = h("p", { class: "err", hidden: true, role: "alert", id: "s-err" });
+  var list = h("div", { class: "items", id: "s-items" });
+  var count = h("span", { class: "muted", id: "s-count" });
+  var nameIn = h("input", { id: "s-name", type: "text", maxlength: "60", placeholder: "Thanksgiving at Grandma’s, Team potluck…", autocomplete: "off", oninput: function (e) { f.name = e.target.value; } });
+  var dateIn = h("input", { id: "s-date", type: "date", min: todayStr(), oninput: function (e) { f.date = e.target.value; } });
+  function paintCount() {
+    var n = rows.filter(function (r) { return r.name.trim(); }).length;
+    count.textContent = n ? plural(n, "item", "items") + " on the list" : "No items yet. You can add them later too.";
+  }
+  function paint() {
+    list.replaceChildren();
+    rows.forEach(function (r, i) {
+      var del = h("button", { class: "btn ghost sm danger", type: "button", "aria-label": "Remove item " + (i + 1), onclick: function () {
+        rows = rows.filter(function (x) { return x !== r; }); paint(); } }, icon("trash"), "Remove");
+      list.append(h("div", { class: "card item su-new", "data-row": r.name || ("row " + (i + 1)) },
+        h("div", { class: "item-head" }, h("span", { class: "lbl", text: "Item " + (i + 1) }), del),
+        h("div", { class: "su-grid" },
+          h("div", { class: "field" }, h("label", { for: "s-" + r.key + "-name", text: "Item" }),
+            h("input", { id: "s-" + r.key + "-name", class: "s-item-name", type: "text", maxlength: "80", value: r.name, placeholder: "Mashed potatoes", autocomplete: "off",
+              oninput: function (e) { r.name = e.target.value; paintCount(); } })),
+          h("div", { class: "field su-qty" }, h("label", { for: "s-" + r.key + "-qty", text: "How many" }),
+            h("input", { id: "s-" + r.key + "-qty", class: "s-item-qty", type: "number", min: "1", max: "99", step: "1", inputmode: "numeric", value: r.qty,
+              oninput: function (e) { r.qty = e.target.value; } }))),
+        h("div", { class: "field" }, h("label", { for: "s-" + r.key + "-desc" }, "Notes ", h("span", { class: "opt", text: "(optional)" })),
+          h("input", { id: "s-" + r.key + "-desc", class: "s-item-desc", type: "text", maxlength: "300", value: r.description, placeholder: "Size, flavor, or anything to know", autocomplete: "off",
+            oninput: function (e) { r.description = e.target.value; } }))));
+    });
+    paintCount();
+  }
+  var tgBtn = h("button", { class: "btn", type: "button", id: "s-thanksgiving" }, "🦃 Fill in Thanksgiving dishes");
+  var armed = false;
+  tgBtn.addEventListener("click", function () {
+    if (hasContent() && !armed) { armed = true; tgBtn.textContent = "Replace your items with Thanksgiving dishes?"; return; }
+    armed = false; tgBtn.textContent = "🦃 Fill in Thanksgiving dishes";
+    rows = THANKSGIVING.map(function (d) { return row(d[0], d[1], d[2]); });
+    var y = new Date().getFullYear(), day = thanksgivingDay(y);
+    if (dateHasPassed(isoDay(day))) day = thanksgivingDay(y + 1);
+    if (!f.name.trim()) { f.name = "Thanksgiving " + day.getFullYear(); nameIn.value = f.name; }
+    if (!f.date) { f.date = isoDay(day); dateIn.value = f.date; }
+    paint();
+    toast("Added " + rows.length + " Thanksgiving dishes. Edit or remove any of them.");
+  });
+  var addBtn = h("button", { class: "btn", type: "button", id: "s-add-row", onclick: function () {
+    var r = row(); rows.push(r); paint();
+    var el = document.getElementById("s-" + r.key + "-name"); if (el) el.focus();
+  } }, icon("plus"), "Add another item");
+  var btn = h("button", { class: "btn primary", type: "submit", id: "s-create", text: "Create sign-up list" });
+  var form = h("form", { class: "panel", id: "s-form", novalidate: true },
+    h("div", { class: "card item" },
+      h("div", { class: "field" }, h("label", { for: "s-name", text: "Event name" }), nameIn),
+      h("div", { class: "field" }, h("label", { for: "s-date", text: "Event date" }), dateIn)),
+    h("div", { class: "page-head" }, h("h3", { text: "What do you need?" }),
+      h("p", { class: "muted", text: "List what people can bring and how many of each you’d like. Anyone who joins can claim an item or add their own." })),
+    h("div", null, tgBtn),
+    list, h("div", { style: "display:flex;gap:10px;align-items:center;flex-wrap:wrap" }, addBtn, count),
+    err,
+    h("div", { class: "bar" }, h("span", { class: "muted", text: "You’ll be the host." }),
+      h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" },
+        h("button", { class: "btn ghost", type: "button", id: "s-cancel", onclick: function () { route = { name: "dashboard" }; renderMain(); }, text: "Cancel" }), btn)));
+  form.addEventListener("submit", async function (e) {
+    e.preventDefault();
+    var items = [], problem = !f.name.trim() ? "Give the event a name."
+      : !f.date ? "Choose the event date."
+      : dateHasPassed(f.date) ? "Choose an event date that is today or later." : "";
+    if (!problem) rows.forEach(function (r, i) {
+      if (problem || (!r.name.trim() && !r.description.trim())) return;
+      var q = Number(r.qty);
+      if (!r.name.trim()) problem = "Item " + (i + 1) + " needs a name.";
+      else if (!Number.isInteger(q) || q < 1 || q > 99) problem = "The quantity for " + r.name.trim() + " must be a whole number from 1 to 99.";
+      else items.push({ name: r.name.trim(), description: r.description.trim(), quantity: q });
+    });
+    if (problem) { err.textContent = problem; err.hidden = false; return; }
+    err.hidden = true; btn.disabled = true; btn.textContent = "Creating…";
+    try {
+      var id = await api(sb.rpc("create_signup", { p_name: f.name.trim(), p_event: f.date, p_items: items }));
+      await openGroup(id, "members");
+      toast("Sign-up list created. Share the invite link from the Host tab.");
+    } catch (ex) { err.textContent = humanize(ex); err.hidden = false; btn.disabled = false; btn.textContent = "Create sign-up list"; }
+  });
+  paint();
+  setTimeout(function () { nameIn.focus(); }, 0);
+  return h("div", { class: "panel" },
+    h("button", { class: "btn ghost back", type: "button", id: "back-dash", onclick: function () { route = { name: "dashboard" }; renderMain(); } }, icon("back"), "All groups"),
+    h("div", { class: "page-head" }, h("h2", { text: "New sign-up list" }),
+      h("p", { class: "muted", text: "For a potluck, a holiday dinner or any event where people bring things. Share the link and everyone claims what they’ll bring, so nothing is doubled up." })),
+    form);
+}
+
+/* the list everyone sees */
+function suStatusCard() {
+  var st = suStats();
+  var pct = st.need ? Math.round(st.have / st.need * 100) : 0;
+  var card = h("div", { class: "card stack", id: "su-status" },
+    h("div", { class: "prog-row" }, h("span", { text: st.items ? st.covered + " of " + plural(st.items, "item", "items") + " covered" : "No items yet" }),
+      h("span", { text: st.open ? st.open + " still needed" : st.items ? "Everything’s covered" : "" })),
+    h("div", { class: "progress" }, h("b", { style: "width:" + pct + "%" })));
+  card.append(st.mine.length
+    ? h("p", { id: "su-mine-line" }, h("strong", { text: "You’re bringing: " }), st.mine.map(function (x) { return x.item.name + (x.claim.amount > 1 ? " ×" + x.claim.amount : ""); }).join(", "))
+    : h("p", { class: "su-none", id: "su-mine-line", text: isArchived() ? "You didn’t sign up for anything." : "You haven’t picked anything yet. Choose something below." }));
+  card.append(suImageButtons());
+  return card;
+}
+function suListView() {
+  var wrap = h("div", { class: "panel" });
+  var g = groupInfo();
+  wrap.append(h("div", { class: "page-head" }, h("h2", { text: "What to bring" }),
+    h("p", { class: "muted", text: fmtDay(g.event_date) + (isArchived() ? ". This list is closed." : ". Claim what you’ll bring, or add something that’s missing.") })));
+  wrap.append(suStatusCard());
+  var items = gd.su.items;
+  if (!items.length) wrap.append(h("div", { class: "card empty", id: "su-empty" }, h("h3", { text: "Nothing on the list yet" }),
+    h("p", { class: "muted", text: isArchived() ? "This list was closed before anything was added." : "Add the first item below." })));
+  var listEl = h("div", { class: "items", id: "su-items" });
+  items.forEach(function (it) { listEl.append(suItemCard(it)); });
+  wrap.append(listEl);
+  if (!isArchived()) wrap.append(suAddCard());
+  return wrap;
+}
+function suItemCard(it) {
+  var left = suLeft(it), mine = suMine(it), claims = suClaims(it), frozen = isArchived();
+  var card = h("div", { class: "card su-item" + (left === 0 ? " covered" : ""), "data-item": it.name });
+  var status = left === 0 ? h("span", { class: "pill", "data-status": "covered" }, icon("check"), "Covered")
+    : h("span", { class: "chip red", "data-status": "open", text: it.quantity === 1 ? "Needed" : left + " of " + it.quantity + " still needed" });
+  card.append(h("div", { class: "su-head" },
+    h("div", { style: "min-width:0" }, h("h3", { text: it.name }), it.quantity > 1 ? h("span", { class: "muted", style: "font-size:13px", text: "Need " + it.quantity }) : null),
+    status));
+  if (it.description) card.append(h("p", { class: "desc muted", text: it.description }));
+  var who = h("div", { class: "su-claimers" });
+  claims.forEach(function (c) {
+    var chip = h("span", { class: "su-chip" + (c.member_id === myId ? " me" : ""), "data-claimer": nameOf(c.member_id) }, avatar(c.member_id, "xs"), suClaimText(c));
+    if (isAdmin() && !frozen && c.member_id !== myId) {
+      chip.append(h("button", { class: "su-x", type: "button", "aria-label": "Take " + it.name + " off " + nameOf(c.member_id), text: "×",
+        onclick: function () { suRun(card, function () { return api(sb.rpc("signup_assign", { p_item: it.id, p_member: c.member_id, p_amount: 0 })); }, stop(it.name + " taken off " + nameOf(c.member_id))); } }));
+    }
+    who.append(chip);
+  });
+  if (claims.length) card.append(who);
+  if (frozen) return card;
+
+  var actions = h("div", { class: "su-actions" });
+  if (mine) {
+    var maxMine = left + mine.amount;
+    if (maxMine > 1) {
+      var sel = amountSelect(maxMine, mine.amount, "How many " + it.name + " you’re bringing");
+      sel.addEventListener("change", function () {
+        var n = Number(sel.value);
+        suRun(card, function () { return api(sb.rpc("signup_claim", { p_item: it.id, p_amount: n })); }, "Updated: you’re bringing " + n + ".");
+      });
+      actions.append(h("label", { class: "su-amt-label" }, "You’re bringing", sel));
+    } else {
+      actions.append(h("span", { class: "buy mine", "data-mine": it.name }, h("span", { class: "box" }, icon("check")), "You’re bringing this"));
+    }
+    actions.append(h("button", { class: "btn sm ghost", type: "button", "data-release": it.name, text: "I can’t bring it",
+      onclick: function () { suRun(card, function () { return api(sb.rpc("signup_claim", { p_item: it.id, p_amount: 0 })); }, "You’re no longer bringing " + it.name + "."); } }));
+  } else if (left > 0) {
+    var amt = left > 1 ? amountSelect(left, 1, "How many " + it.name + " you’ll bring") : null;
+    actions.append(h("button", { class: "buy", type: "button", "data-claim": it.name, onclick: function () {
+      var n = amt ? Number(amt.value) : 1;
+      suRun(card, function () { return api(sb.rpc("signup_claim", { p_item: it.id, p_amount: n })); }, "Thanks! You’re bringing " + it.name + ".");
+    } }, h("span", { class: "box" }), "I’ll bring this"));
+    if (amt) actions.append(h("label", { class: "su-amt-label" }, "How many", amt));
+  }
+  var assignForm = isAdmin() ? suAssignForm(it, card) : null;
+  var editForm = suCanEdit(it) ? suEditForm(it, card) : null;
+  if (assignForm) actions.append(h("button", { class: "btn sm", type: "button", "data-assign": it.name, text: "Assign",
+    onclick: function () { if (editForm) editForm.hidden = true; assignForm.hidden = !assignForm.hidden; } }));
+  if (editForm) actions.append(h("button", { class: "btn sm ghost", type: "button", "data-edit": it.name, text: "Edit",
+    onclick: function () { if (assignForm) assignForm.hidden = true; editForm.hidden = !editForm.hidden; } }));
+  card.append(actions);
+  if (assignForm) card.append(assignForm);
+  if (editForm) card.append(editForm);
+  return card;
+}
+function suAssignForm(it, card) {
+  var people = suPeople();
+  var who = h("select", { class: "su-who", "aria-label": "Who is bringing " + it.name },
+    people.map(function (m) { return h("option", { value: m, text: nameOf(m) + (m === myId ? " (you)" : "") }); }));
+  var amtWrap = h("span");
+  function current(m) { var c = suClaims(it).find(function (x) { return x.member_id === m; }); return c ? c.amount : 0; }
+  function paintAmt() {
+    var max = suLeft(it) + current(who.value);
+    amtWrap.replaceChildren(max > 1 ? h("label", { class: "su-amt-label" }, "How many", amountSelect(max, Math.max(1, current(who.value)), "How many", "su-assign-amt")) : "");
+  }
+  who.addEventListener("change", paintAmt);
+  var unassigned = people.find(function (m) { return !current(m); });
+  if (unassigned) who.value = unassigned;
+  paintAmt();
+  var form = h("form", { class: "su-form", hidden: true, "data-assign-form": it.name, novalidate: true },
+    h("div", { class: "su-actions" }, h("label", { class: "su-amt-label" }, "Assign to", who), amtWrap),
+    h("div", { class: "su-actions" }, h("button", { class: "btn sm primary", type: "submit", text: "Assign" }),
+      h("button", { class: "btn sm ghost", type: "button", text: "Cancel", onclick: function () { form.hidden = true; } })),
+    h("p", { class: "muted", style: "font-size:13px", text: "They won’t be emailed. They’ll see it on the list and under My items." }));
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var a = form.querySelector(".su-assign-amt"), n = a ? Number(a.value) : 1, m = who.value;
+    if (suLeft(it) + current(m) < 1) { toast("That item is already covered. Take it off someone first."); return; }
+    suRun(form, function () { return api(sb.rpc("signup_assign", { p_item: it.id, p_member: m, p_amount: n })); }, stop(it.name + " assigned to " + nameOf(m)));
+  });
+  return form;
+}
+function suFields(prefix, it) {
+  return {
+    name: h("input", { id: prefix + "-name", type: "text", maxlength: "80", value: it ? it.name : "", placeholder: "Item", autocomplete: "off" }),
+    desc: h("input", { id: prefix + "-desc", type: "text", maxlength: "300", value: it ? it.description || "" : "", placeholder: "Size, flavor, or anything to know", autocomplete: "off" }),
+    qty: h("input", { id: prefix + "-qty", type: "number", min: "1", max: "99", step: "1", inputmode: "numeric", value: String(it ? it.quantity : 1) })
+  };
+}
+function suFieldsBlock(prefix, f) {
+  return h("div", { class: "stack" },
+    h("div", { class: "su-grid" },
+      h("div", { class: "field" }, h("label", { for: prefix + "-name", text: "Item" }), f.name),
+      h("div", { class: "field su-qty" }, h("label", { for: prefix + "-qty", text: "How many" }), f.qty)),
+    h("div", { class: "field" }, h("label", { for: prefix + "-desc" }, "Notes ", h("span", { class: "opt", text: "(optional)" })), f.desc));
+}
+function suReadFields(f) {
+  var q = Number(f.qty.value);
+  if (!f.name.value.trim()) return { problem: "Give the item a name." };
+  if (!Number.isInteger(q) || q < 1 || q > 99) return { problem: "The quantity must be a whole number from 1 to 99." };
+  return { name: f.name.value.trim(), description: f.desc.value.trim(), quantity: q };
+}
+function suEditForm(it, card) {
+  var f = suFields("e-" + it.id, it);
+  var del = h("button", { class: "btn sm danger", type: "button", text: "Delete item" });
+  var conf = h("div", { class: "confirm", hidden: true },
+    h("span", { text: "Delete " + it.name + "?" + (suClaims(it).length ? " Everyone signed up for it is released." : "") }),
+    h("button", { class: "btn sm primary", type: "button", text: "Yes, delete", onclick: function () {
+      suRun(conf, function () { return api(sb.rpc("signup_delete_item", { p_item: it.id })); }, it.name + " deleted."); } }),
+    h("button", { class: "btn sm ghost", type: "button", text: "Cancel", onclick: function () { conf.hidden = true; del.hidden = false; } }));
+  del.addEventListener("click", function () { conf.hidden = false; del.hidden = true; });
+  var form = h("form", { class: "su-form stack", hidden: true, "data-edit-form": it.name, novalidate: true },
+    suFieldsBlock("e-" + it.id, f),
+    h("div", { class: "su-actions" }, h("button", { class: "btn sm primary", type: "submit", text: "Save" }),
+      h("button", { class: "btn sm ghost", type: "button", text: "Cancel", onclick: function () { form.hidden = true; } }), del), conf);
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var v = suReadFields(f);
+    if (v.problem) { toast(v.problem); return; }
+    suRun(form, function () { return api(sb.rpc("signup_edit_item", { p_item: it.id, p_name: v.name, p_description: v.description, p_quantity: v.quantity })); }, "Saved.");
+  });
+  return form;
+}
+function suAddCard() {
+  var f = suFields("su-new");
+  var err = h("p", { class: "err", hidden: true, role: "alert" });
+  var form = h("form", { class: "card stack", id: "su-add", novalidate: true },
+    h("h3", { text: "Add something" }),
+    h("p", { class: "muted", text: "Bringing something that isn’t listed, or think the event needs it? Add it here." }),
+    suFieldsBlock("su-new", f),
+    h("label", { class: "chk" }, h("input", { type: "checkbox", id: "su-new-mine", checked: true }), "I’ll bring it"),
+    err, h("div", null, h("button", { class: "btn primary", type: "submit", id: "su-new-go", text: "Add to the list" })));
+  form.addEventListener("submit", function (e) {
+    e.preventDefault();
+    var v = suReadFields(f);
+    if (v.problem) { err.textContent = v.problem; err.hidden = false; return; }
+    err.hidden = true;
+    var bring = document.getElementById("su-new-mine").checked;
+    suRun(form, async function () {
+      var id = await api(sb.rpc("signup_add_item", { p_group: route.id, p_name: v.name, p_description: v.description, p_quantity: v.quantity }));
+      if (bring) await api(sb.rpc("signup_claim", { p_item: id, p_amount: v.quantity }));
+    }, bring ? "Added. You’re bringing " + v.name + "." : v.name + " added to the list.");
+  });
+  return form;
+}
+
+/* My items: what I'm bringing, and where the list stands */
+function suMineView() {
+  var st = suStats();
+  var wrap = h("div", { class: "panel" });
+  wrap.append(h("div", { class: "page-head" }, h("h2", { text: "My items" }),
+    h("p", { class: "muted", text: st.mine.length ? "You’re bringing " + plural(st.mine.length, "item", "items") + "." : "You haven’t signed up for anything yet." })));
+  if (!st.mine.length) {
+    wrap.append(h("div", { class: "card empty", id: "su-mine-empty" }, h("h3", { text: isArchived() ? "You didn’t sign up for anything" : "Nothing picked yet" }),
+      h("p", { class: "muted", text: isArchived() ? "This list is closed." : st.open ? plural(st.open, "item still needs", "items still need") + " someone. Pick one and it shows up here." : "Everything is already covered, but you can still add something." }),
+      isArchived() ? null : h("button", { class: "btn sm primary", type: "button", id: "su-browse", onclick: function () { setView("members"); }, text: "See what’s needed" })));
+  } else {
+    var ul = h("ul", { class: "buylist", id: "su-mine-list" });
+    st.mine.forEach(function (x) {
+      var by = x.claim.assigned_by && x.claim.assigned_by !== myId ? "Assigned by " + nameOf(x.claim.assigned_by) : "";
+      ul.append(h("li", { class: "buyrow", "data-mine-item": x.item.name },
+        h("span", { class: "bn" }, h("strong", { text: x.item.name }), x.item.description ? h("span", { class: "muted", style: "display:block;font-size:13px", text: x.item.description }) : null,
+          by ? h("span", { class: "chip gold", style: "margin-top:4px;display:inline-block", text: by }) : null),
+        h("span", { class: "bp", text: "×" + x.claim.amount })));
+    });
+    wrap.append(h("div", { class: "card" }, h("h3", { text: "You’re bringing" }), ul));
+  }
+  // where the whole list stands
+  var open = gd.su.items.filter(function (it) { return suLeft(it) > 0; });
+  var pct = st.need ? Math.round(st.have / st.need * 100) : 0;
+  var status = h("div", { class: "card stack", id: "su-list-status" }, h("h3", { text: "List status" }),
+    h("div", { class: "prog-row" }, h("span", { text: st.covered + " of " + plural(st.items, "item", "items") + " covered" }), h("span", { text: pct + "%" })),
+    h("div", { class: "progress" }, h("b", { style: "width:" + pct + "%" })));
+  if (open.length) {
+    status.append(h("p", { class: "muted", text: "Still needed:" }),
+      h("ul", { class: "buylist", id: "su-open-list" }, open.map(function (it) {
+        return h("li", { class: "buyrow" }, h("span", { class: "bn", text: it.name }), h("span", { class: "muted bp", text: it.quantity === 1 ? "Needed" : suLeft(it) + " of " + it.quantity + " needed" }));
+      })));
+    if (!isArchived()) status.append(h("div", null, h("button", { class: "btn sm", type: "button", onclick: function () { setView("members"); }, text: "Open the list" })));
+  } else if (st.items) {
+    status.append(h("p", { class: "su-done", text: "Everything on the list has someone bringing it." }));
+  }
+  status.append(suImageButtons());
+  wrap.append(status);
+  return wrap;
+}
+
+/* share the list as an image */
+function suImageButtons() {
+  var row = h("div", { class: "su-actions su-share" });
+  var save = h("button", { class: "btn sm", type: "button", "data-image": "save", text: "Save list as image" });
+  save.addEventListener("click", async function () {
+    save.disabled = true;
+    try { var b = await suImageBlob(); downloadBlob(b, suImageName()); toast("Image saved."); }
+    catch (e) { toast("Couldn’t make the image. Try again."); }
+    save.disabled = false;
+  });
+  row.append(save);
+  if (navigator.share && navigator.canShare) {
+    var share = h("button", { class: "btn sm", type: "button", "data-image": "share", text: "Share image" });
+    share.addEventListener("click", async function () {
+      share.disabled = true;
+      try {
+        var b = await suImageBlob(), file = new File([b], suImageName(), { type: "image/png" });
+        if (navigator.canShare({ files: [file] })) await navigator.share({ files: [file], title: groupInfo().name });
+        else { downloadBlob(b, suImageName()); toast("Sharing isn’t available here, so the image was saved instead."); }
+      } catch (e) { if (!e || e.name !== "AbortError") toast("Couldn’t share the image."); }
+      share.disabled = false;
+    });
+    row.append(share);
+  }
+  return row;
+}
+function suImageName() { return (groupInfo().name || "sign-up list").replace(/[^a-z0-9]+/gi, "-").replace(/^-|-$/g, "").toLowerCase() + ".png"; }
+function downloadBlob(blob, name) {
+  var url = URL.createObjectURL(blob), a = h("a", { href: url, download: name });
+  document.body.append(a); a.click(); a.remove();
+  setTimeout(function () { URL.revokeObjectURL(url); }, 4000);
+}
+// Wraps text to a width; returns the lines.
+function wrapLines(ctx, text, width) {
+  var words = String(text).split(/\s+/), lines = [], cur = "";
+  words.forEach(function (w) {
+    var t = cur ? cur + " " + w : w;
+    if (ctx.measureText(t).width <= width || !cur) cur = t; else { lines.push(cur); cur = w; }
+  });
+  if (cur) lines.push(cur);
+  return lines;
+}
+async function suImageBlob() {
+  var DISPLAY = '"Young Serif", Georgia, serif', BODY = '"Instrument Sans", system-ui, sans-serif';
+  try { await Promise.all([document.fonts.load("56px " + DISPLAY), document.fonts.load("600 30px " + BODY), document.fonts.load("26px " + BODY)]); } catch (e) { /* fall back to system fonts */ }
+  var g = groupInfo(), st = suStats(), W = 1080, P = 64, inner = W - P * 2;
+  var C = { banner: "#134a32", gold: "#f3d676", ink: "#14261b", muted: "#546a5b", line: "#d5e3d7", good: "#1c6b44", berry: "#b5222f", bg: "#f4f8f3", card: "#ffffff" };
+  var canvas = document.createElement("canvas"), ctx = canvas.getContext("2d");
+  // lay everything out first so the canvas is exactly as tall as it needs to be
+  function rowsFor(it) {
+    var left = suLeft(it), out = [];
+    ctx.font = "600 34px " + BODY;
+    var statusText = left === 0 ? "Covered" : it.quantity === 1 ? "Needed" : left + " of " + it.quantity + " needed";
+    var statusW = ctx.measureText(statusText).width;
+    ctx.font = "600 34px " + BODY;
+    wrapLines(ctx, it.name + (it.quantity > 1 ? " (" + it.quantity + ")" : ""), inner - statusW - 40).forEach(function (l, i) { out.push({ font: "600 34px " + BODY, color: C.ink, text: l, h: 44, status: i === 0 ? { text: statusText, color: left === 0 ? C.good : C.berry } : null }); });
+    if (it.description) { ctx.font = "26px " + BODY; wrapLines(ctx, it.description, inner).forEach(function (l) { out.push({ font: "26px " + BODY, color: C.muted, text: l, h: 36 }); }); }
+    var who = suClaims(it).map(function (c) { return nameOf(c.member_id) + (c.amount > 1 ? " ×" + c.amount : ""); }).join(", ");
+    ctx.font = "28px " + BODY;
+    wrapLines(ctx, who ? "Bringing: " + who : "No one yet", inner).forEach(function (l) { out.push({ font: "28px " + BODY, color: who ? C.good : C.berry, text: l, h: 38 }); });
+    return out;
+  }
+  var blocks = gd.su.items.map(rowsFor);
+  ctx.font = "56px " + DISPLAY;
+  var titleLines = wrapLines(ctx, g.name, inner);
+  var headH = 70 + titleLines.length * 68 + 60 + 40;
+  var bodyH = blocks.reduce(function (n, b) { return n + b.reduce(function (m, r) { return m + r.h; }, 0) + 44; }, 0) || 80;
+  var H = headH + 40 + bodyH + 100;
+  canvas.width = W; canvas.height = Math.min(H, 30000);
+  ctx.fillStyle = C.bg; ctx.fillRect(0, 0, W, canvas.height);
+  ctx.fillStyle = C.banner; ctx.fillRect(0, 0, W, headH);
+  for (var sx = -40; sx < W; sx += 40) { ctx.fillStyle = (sx / 40) % 2 ? "#ffffff" : "#c4222f"; ctx.beginPath(); ctx.moveTo(sx, 0); ctx.lineTo(sx + 20, 0); ctx.lineTo(sx + 32, 12); ctx.lineTo(sx + 12, 12); ctx.fill(); }
+  ctx.textBaseline = "alphabetic";
+  var y = 70;
+  ctx.fillStyle = C.gold; ctx.font = "600 24px " + BODY; ctx.fillText("SIGN-UP LIST · " + fmtDay(g.event_date).toUpperCase(), P, y); y += 70;
+  ctx.fillStyle = "#ffffff"; ctx.font = "56px " + DISPLAY;
+  titleLines.forEach(function (l) { ctx.fillText(l, P, y); y += 68; });
+  ctx.fillStyle = C.gold; ctx.font = "28px " + BODY;
+  ctx.fillText(st.items ? st.covered + " of " + st.items + " items covered" + (st.open ? " · " + st.open + " still needed" : " · everything is covered") : "Nothing on the list yet", P, y);
+  y = headH + 40;
+  ctx.fillStyle = C.card; ctx.strokeStyle = C.line; ctx.lineWidth = 2;
+  blocks.forEach(function (b, bi) {
+    var top = y;
+    b.forEach(function (r) {
+      y += r.h;
+      ctx.font = r.font; ctx.fillStyle = r.color; ctx.textAlign = "left"; ctx.fillText(r.text, P, y - 10);
+      if (r.status) { ctx.font = "600 26px " + BODY; ctx.fillStyle = r.status.color; ctx.textAlign = "right"; ctx.fillText(r.status.text, W - P, y - 12); ctx.textAlign = "left"; }
+    });
+    y += 22;
+    if (bi < blocks.length - 1) { ctx.strokeStyle = C.line; ctx.beginPath(); ctx.moveTo(P, y); ctx.lineTo(W - P, y); ctx.stroke(); }
+    y += 22;
+  });
+  ctx.fillStyle = C.muted; ctx.font = "22px " + BODY; ctx.textAlign = "left";
+  ctx.fillText("Made with Wish Orbit", P, canvas.height - 44);
+  return await new Promise(function (resolve, reject) { canvas.toBlob(function (b) { b ? resolve(b) : reject(new Error("toBlob failed")); }, "image/png"); });
 }
 
 /* ---------- boot ---------- */

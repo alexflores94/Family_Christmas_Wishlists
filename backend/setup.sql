@@ -84,7 +84,9 @@ alter table public.groups add column if not exists kind text not null default 'g
 -- 'secret_santa' = like a group, but nobody can read anyone else's list until the host draws names; then each
 -- player can read (and buy from) only the one list they were given.
 alter table public.groups drop constraint if exists groups_kind_check;
-alter table public.groups add constraint groups_kind_check check (kind in ('group', 'registry', 'secret_santa'));
+-- 'signup' = an event sign-up list: the host lists what the event needs (dishes for Thanksgiving, say) and
+-- members claim what they will bring. See the Sign-up lists section below.
+alter table public.groups add constraint groups_kind_check check (kind in ('group', 'registry', 'secret_santa', 'signup'));
 -- When the Secret Santa names were drawn (null until then). It cannot be undone.
 alter table public.groups add column if not exists draw_at timestamptz;
 
@@ -223,6 +225,54 @@ create table if not exists public.list_about (
   primary key (group_id, owner),
   foreign key (group_id, owner) references public.group_members(group_id, member_id) on delete cascade
 );
+
+-- ---------------------------------------------------------------------------
+-- Sign-up lists (groups of kind 'signup')
+-- ---------------------------------------------------------------------------
+-- What the event needs. Any member can add an item; the host or whoever added it can change or delete it.
+create table if not exists public.signup_items (
+  id          uuid primary key default gen_random_uuid(),
+  group_id    uuid not null references public.groups(id) on delete cascade,
+  name        text not null check (length(trim(name)) between 1 and 80),
+  description text check (description is null or length(description) <= 300),
+  quantity    int  not null default 1 check (quantity between 1 and 99),   -- how many are requested
+  position    int  not null default 0,
+  added_by    uuid references public.profiles(id),
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now()
+);
+create index if not exists signup_items_group_idx on public.signup_items(group_id, position);
+
+-- Who is bringing what, and how many. assigned_by is set when the host assigned it to them.
+-- Leaving the group (or being removed) releases everything they had.
+create table if not exists public.signup_claims (
+  item_id     uuid not null references public.signup_items(id) on delete cascade,
+  group_id    uuid not null,
+  member_id   uuid not null,
+  amount      int  not null default 1 check (amount between 1 and 99),
+  assigned_by uuid references public.profiles(id),
+  created_at  timestamptz not null default now(),
+  updated_at  timestamptz not null default now(),
+  primary key (item_id, member_id),
+  foreign key (group_id, member_id) references public.group_members(group_id, member_id) on delete cascade
+);
+create index if not exists signup_claims_group_idx on public.signup_claims(group_id);
+
+-- What happened on a sign-up list, for the host's hourly summary email. Nobody can read it from the website.
+create table if not exists public.signup_activity (
+  id         bigint generated always as identity primary key,
+  group_id   uuid not null references public.groups(id) on delete cascade,
+  actor      uuid,
+  action     text not null check (action in ('joined', 'added', 'edited', 'removed', 'claimed', 'changed', 'released', 'assigned', 'unassigned')),
+  item_name  text,
+  target     uuid,
+  amount     int,
+  created_at timestamptz not null default now(),
+  emailed_at timestamptz
+);
+create index if not exists signup_activity_pending_idx on public.signup_activity(group_id) where emailed_at is null;
+-- When the host was last sent a summary, so it goes out at most once an hour.
+alter table public.groups add column if not exists summary_sent_at timestamptz;
 
 -- Suggestions and bug reports. Nobody can read this table directly; the app owner reads it through owner_feedback().
 create table if not exists public.feedback (
@@ -724,7 +774,12 @@ as $$
          g.admin_id = public.my_id(), g.item_min,
          -- in a registry "members" counts the lists (the people the wishes are for)
          (select count(*)::int from public.group_members x where x.group_id = g.id and ((g.kind <> 'registry') <> x.is_recipient)),
-         case when g.kind = 'secret_santa' then
+         case when g.kind = 'signup' then
+           -- items that still need someone to bring them
+           (select count(*)::int from public.signup_items si
+             where si.group_id = g.id
+               and coalesce((select sum(c.amount) from public.signup_claims c where c.item_id = si.id), 0) < si.quantity)
+         when g.kind = 'secret_santa' then
            -- one person to shop for, once the names are drawn
            (select count(*)::int from public.santa_assignments a
              where a.group_id = g.id and a.giver = public.my_id()
@@ -741,7 +796,9 @@ as $$
                and not exists (select 1 from public.extra_purchases e
                                where e.group_id = g.id and e.buyer = public.my_id() and e.recipient = x.member_id))
          end,
-         (g.kind = 'registry' or public.list_submitted(g.id, public.my_id())),
+         -- in a sign-up list: whether I have signed up to bring anything
+         case when g.kind = 'signup' then exists (select 1 from public.signup_claims c where c.group_id = g.id and c.member_id = public.my_id())
+              else (g.kind = 'registry' or public.list_submitted(g.id, public.my_id())) end,
          (select p.name from public.profiles p where p.id = g.admin_id),
          g.kind,
          g.draw_at is not null
@@ -786,6 +843,9 @@ begin
     raise exception 'The names have already been drawn for this Secret Santa, so it is closed to new players';
   end if;
   insert into public.group_members (group_id, member_id) values (g, m);
+  if exists (select 1 from public.groups where id = g and kind = 'signup') then
+    insert into public.signup_activity (group_id, actor, action) values (g, m, 'joined');
+  end if;
   return g;
 end
 $$;
@@ -1236,6 +1296,281 @@ end
 $$;
 
 -- Suggestions and bug reports from signed-in people.
+-- ---------------------------------------------------------------------------
+-- Sign-up lists. Every change goes through these functions, which check the rules and record what
+-- happened for the host's summary email. Nobody is emailed when people join or change the list.
+-- ---------------------------------------------------------------------------
+create or replace function public.is_signup(p_group uuid)
+returns boolean
+language sql stable security definer
+set search_path = public, pg_temp
+as $$
+  select exists (select 1 from public.groups where id = p_group and kind = 'signup')
+$$;
+
+-- Internal: records one thing that happened, for the host's summary.
+create or replace function public.signup_log(p_group uuid, p_action text, p_item text, p_target uuid, p_amount int)
+returns void
+language sql security definer
+set search_path = public, pg_temp
+as $$
+  insert into public.signup_activity (group_id, actor, action, item_name, target, amount)
+  values (p_group, public.my_id(), p_action, p_item, p_target, p_amount)
+$$;
+
+-- Internal: checks an item's fields. Returns the cleaned description (null when blank).
+create or replace function public.signup_check(p_name text, p_description text, p_quantity int)
+returns text
+language plpgsql immutable
+as $$
+begin
+  if length(trim(coalesce(p_name, ''))) not between 1 and 80 then raise exception 'Enter an item name up to 80 characters'; end if;
+  if length(trim(coalesce(p_description, ''))) > 300 then raise exception 'Item notes can be up to 300 characters'; end if;
+  if p_quantity is null or p_quantity not between 1 and 99 then raise exception 'The quantity must be between 1 and 99'; end if;
+  return nullif(trim(coalesce(p_description, '')), '');
+end
+$$;
+
+-- Makes a sign-up list. p_items is a JSON array of {name, description, quantity}; it may be empty.
+create or replace function public.create_signup(p_name text, p_event date, p_items jsonb)
+returns uuid
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare
+  m uuid := public.my_id();
+  g uuid;
+  it jsonb;
+  i int := 0;
+  d text;
+begin
+  if public.me() is null then raise exception 'Not authenticated'; end if;
+  if m is null then raise exception 'Add your name first'; end if;
+  if length(trim(coalesce(p_name, ''))) not between 1 and 60 then raise exception 'Enter an event name up to 60 characters'; end if;
+  if p_event is null then raise exception 'Choose the event date'; end if;
+  if p_event < public.today_local() then raise exception 'The event date has already passed. Choose a date that is today or later'; end if;
+  if p_items is not null and jsonb_typeof(p_items) <> 'array' then raise exception 'Items must be a list'; end if;
+  if jsonb_array_length(coalesce(p_items, '[]'::jsonb)) > 200 then raise exception 'A sign-up list can have up to 200 items'; end if;
+
+  insert into public.groups (name, event_date, item_min, admin_id, kind)
+  values (trim(p_name), p_event, 1, m, 'signup') returning id into g;
+  insert into public.group_members (group_id, member_id) values (g, m);
+  insert into public.group_invites (group_id, code) values (g, substr(replace(gen_random_uuid()::text, '-', ''), 1, 24));
+  for it in select * from jsonb_array_elements(coalesce(p_items, '[]'::jsonb)) loop
+    d := public.signup_check(it ->> 'name', it ->> 'description', (it ->> 'quantity')::int);
+    insert into public.signup_items (group_id, name, description, quantity, position, added_by)
+    values (g, trim(it ->> 'name'), d, (it ->> 'quantity')::int, i, m);
+    i := i + 1;
+  end loop;
+  return g;
+end
+$$;
+
+-- Any member adds an item. Returns its id.
+create or replace function public.signup_add_item(p_group uuid, p_name text, p_description text, p_quantity int)
+returns uuid
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare r uuid; d text;
+begin
+  if not public.is_member(p_group) or not public.is_signup(p_group) then raise exception 'You are not in this sign-up list'; end if;
+  if not public.group_open(p_group) then raise exception 'This sign-up list is archived, so it can no longer be changed'; end if;
+  d := public.signup_check(p_name, p_description, p_quantity);
+  if (select count(*) from public.signup_items where group_id = p_group) >= 200 then raise exception 'A sign-up list can have up to 200 items'; end if;
+  insert into public.signup_items (group_id, name, description, quantity, position, added_by)
+  values (p_group, trim(p_name), d, p_quantity,
+          coalesce((select max(position) + 1 from public.signup_items where group_id = p_group), 0), public.my_id())
+  returning id into r;
+  perform public.signup_log(p_group, 'added', trim(p_name), null, p_quantity);
+  return r;
+end
+$$;
+
+-- The host, or whoever added the item, changes it. The quantity can't drop below what people already signed up for.
+create or replace function public.signup_edit_item(p_item uuid, p_name text, p_description text, p_quantity int)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare it public.signup_items; d text; taken int;
+begin
+  select * into it from public.signup_items where id = p_item for update;
+  if it.id is null or not public.is_member(it.group_id) then raise exception 'That item is not on this sign-up list'; end if;
+  if not (public.is_admin(it.group_id) or it.added_by = public.my_id()) then raise exception 'Only the host or the person who added this item can change it'; end if;
+  if not public.group_open(it.group_id) then raise exception 'This sign-up list is archived, so it can no longer be changed'; end if;
+  d := public.signup_check(p_name, p_description, p_quantity);
+  select coalesce(sum(amount), 0) into taken from public.signup_claims where item_id = p_item;
+  if p_quantity < taken then
+    raise exception 'People have already signed up for % of these, so the quantity can''t be lower than %', taken, taken;
+  end if;
+  update public.signup_items set name = trim(p_name), description = d, quantity = p_quantity, updated_at = now() where id = p_item;
+  if it.name <> trim(p_name) or coalesce(it.description, '') <> coalesce(d, '') or it.quantity <> p_quantity then
+    perform public.signup_log(it.group_id, 'edited', trim(p_name), null, p_quantity);
+  end if;
+end
+$$;
+
+-- The host, or whoever added the item, deletes it. Anyone signed up for it is released.
+create or replace function public.signup_delete_item(p_item uuid)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare it public.signup_items;
+begin
+  select * into it from public.signup_items where id = p_item;
+  if it.id is null or not public.is_member(it.group_id) then raise exception 'That item is not on this sign-up list'; end if;
+  if not (public.is_admin(it.group_id) or it.added_by = public.my_id()) then raise exception 'Only the host or the person who added this item can change it'; end if;
+  if not public.group_open(it.group_id) then raise exception 'This sign-up list is archived, so it can no longer be changed'; end if;
+  delete from public.signup_items where id = p_item;
+  perform public.signup_log(it.group_id, 'removed', it.name, null, null);
+end
+$$;
+
+-- Internal: sets how many of an item a member brings (0 removes them). Checks that it fits.
+create or replace function public.signup_set_claim(p_item uuid, p_member uuid, p_amount int, p_by_host boolean)
+returns text
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare it public.signup_items; others int; before int;
+begin
+  select * into it from public.signup_items where id = p_item for update;
+  if it.id is null or not public.is_member(it.group_id) then raise exception 'That item is not on this sign-up list'; end if;
+  if not public.group_open(it.group_id) then raise exception 'This sign-up list is archived, so it can no longer be changed'; end if;
+  if p_amount is null or p_amount not between 0 and 99 then raise exception 'The quantity must be between 1 and 99'; end if;
+  if not exists (select 1 from public.group_members where group_id = it.group_id and member_id = p_member and not is_recipient) then
+    raise exception 'That person is not in this sign-up list';
+  end if;
+  select amount into before from public.signup_claims where item_id = p_item and member_id = p_member;
+  if p_amount = 0 then
+    if before is null then return null; end if;
+    delete from public.signup_claims where item_id = p_item and member_id = p_member;
+    return case when p_by_host then 'unassigned' else 'released' end;
+  end if;
+  select coalesce(sum(amount), 0) into others from public.signup_claims where item_id = p_item and member_id <> p_member;
+  if others + p_amount > it.quantity then
+    if others >= it.quantity then raise exception 'That item is already covered'; end if;
+    raise exception 'Only % more of that item % needed', it.quantity - others, case when it.quantity - others = 1 then 'is' else 'are' end;
+  end if;
+  insert into public.signup_claims (item_id, group_id, member_id, amount, assigned_by)
+  values (p_item, it.group_id, p_member, p_amount, case when p_by_host and p_member <> public.my_id() then public.my_id() end)
+  on conflict (item_id, member_id) do update
+    set amount = excluded.amount, updated_at = now(),
+        assigned_by = case when p_by_host then excluded.assigned_by else public.signup_claims.assigned_by end;
+  if before = p_amount then return null; end if;
+  return case when p_by_host and p_member <> public.my_id() then 'assigned' when before is null then 'claimed' else 'changed' end;
+end
+$$;
+
+-- A member signs themself up to bring p_amount of an item (0 = no longer bringing it).
+create or replace function public.signup_claim(p_item uuid, p_amount int)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare a text; it public.signup_items;
+begin
+  a := public.signup_set_claim(p_item, public.my_id(), p_amount, false);
+  select * into it from public.signup_items where id = p_item;
+  if a is not null then perform public.signup_log(it.group_id, a, it.name, null, nullif(p_amount, 0)); end if;
+end
+$$;
+
+-- The host assigns an item to a member (0 = takes it off them).
+create or replace function public.signup_assign(p_item uuid, p_member uuid, p_amount int)
+returns void
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare a text; it public.signup_items;
+begin
+  select * into it from public.signup_items where id = p_item;
+  if it.id is null or not public.is_admin(it.group_id) then raise exception 'Only the group admin can do that'; end if;
+  a := public.signup_set_claim(p_item, p_member, p_amount, true);
+  if a is not null then perform public.signup_log(it.group_id, a, it.name, p_member, nullif(p_amount, 0)); end if;
+end
+$$;
+
+-- Emails each sign-up list's host a summary of what other people did, at most once an hour per list.
+-- A scheduled job calls it every 15 minutes; the website also calls it when it loads, in case the job isn't set up.
+create or replace function public.send_signup_summaries()
+returns int
+language plpgsql security definer
+set search_path = public, pg_temp
+as $$
+declare
+  g        record;
+  a        record;
+  v_to     text;
+  v_max    bigint;
+  v_n      int;
+  v_lines  text;
+  v_who    text;
+  v_need   int;
+  v_have   int;
+  v_open   int;
+  v_sent   int := 0;
+begin
+  for g in
+    select gr.id, gr.name, gr.admin_id from public.groups gr
+     where gr.kind = 'signup'
+       and (gr.summary_sent_at is null or gr.summary_sent_at <= now() - interval '1 hour')
+       and exists (select 1 from public.signup_activity x where x.group_id = gr.id and x.emailed_at is null and x.actor is distinct from gr.admin_id)
+  loop
+    -- Claim this list's slot first, so two callers at once can't both send.
+    update public.groups set summary_sent_at = now()
+     where id = g.id and (summary_sent_at is null or summary_sent_at <= now() - interval '1 hour');
+    if not found then continue; end if;
+
+    select max(id) into v_max from public.signup_activity where group_id = g.id and emailed_at is null;
+    select count(*) into v_n from public.signup_activity
+     where group_id = g.id and emailed_at is null and id <= v_max and actor is distinct from g.admin_id;
+    v_lines := '';
+    for a in
+      select * from public.signup_activity
+       where group_id = g.id and emailed_at is null and id <= v_max and actor is distinct from g.admin_id
+       order by id limit 40
+    loop
+      v_who := public.esc(coalesce(public.group_name_of(g.id, a.actor), 'Someone'));
+      v_lines := v_lines || '<li style="margin:0 0 6px">' || v_who || ' ' || case a.action
+        when 'joined'   then 'joined the list'
+        when 'added'    then 'added <b>' || public.esc(a.item_name) || '</b>' || case when a.amount > 1 then ' (' || a.amount || ' needed)' else '' end
+        when 'edited'   then 'edited <b>' || public.esc(a.item_name) || '</b>'
+        when 'removed'  then 'removed <b>' || public.esc(a.item_name) || '</b>'
+        when 'claimed'  then 'will bring <b>' || public.esc(a.item_name) || '</b>' || case when a.amount > 1 then ' (' || a.amount || ')' else '' end
+        when 'changed'  then 'will now bring ' || coalesce(a.amount, 0) || ' of <b>' || public.esc(a.item_name) || '</b>'
+        when 'released' then 'is no longer bringing <b>' || public.esc(a.item_name) || '</b>'
+        else public.esc(a.action) || ' <b>' || public.esc(coalesce(a.item_name, '')) || '</b>'
+      end || '</li>';
+    end loop;
+    if v_n > 40 then v_lines := v_lines || '<li>…and ' || (v_n - 40) || ' more</li>'; end if;
+
+    select coalesce(sum(i.quantity), 0), coalesce(sum(least(i.quantity, coalesce(c.n, 0))), 0),
+           count(*) filter (where coalesce(c.n, 0) < i.quantity)
+      into v_need, v_have, v_open
+      from public.signup_items i
+      left join (select item_id, sum(amount)::int n from public.signup_claims group by item_id) c on c.item_id = i.id
+     where i.group_id = g.id;
+
+    select email into v_to from public.profiles where id = g.admin_id;
+    if v_to is not null then perform public.send_mail(
+      array[v_to],
+      'Sign-up list update: ' || g.name,
+      public.mail_html(
+        'What changed on ' || public.esc(g.name),
+        '<ul style="margin:0 0 14px;padding-left:20px">' || v_lines || '</ul>'
+          || v_have || ' of ' || v_need || ' needed items are covered'
+          || case when v_open = 0 then ', so everything has someone bringing it.' else '. ' || v_open || case when v_open = 1 then ' item still needs' else ' items still need' end || ' someone.' end,
+        'Open the sign-up list')); end if;
+    update public.signup_activity set emailed_at = now() where group_id = g.id and emailed_at is null and id <= v_max;
+    v_sent := v_sent + 1;
+  end loop;
+  return v_sent;
+end
+$$;
+
 create or replace function public.submit_feedback(p_kind text, p_message text)
 returns void
 language plpgsql security definer
@@ -1323,6 +1658,7 @@ begin
       'groups',     (select count(*) from public.groups where kind = 'group'),
       'wishlists',  (select count(*) from public.groups where kind = 'registry'),
       'santas',     (select count(*) from public.groups where kind = 'secret_santa'),
+      'signups',    (select count(*) from public.groups where kind = 'signup'),
       'open_feedback', (select count(*) from public.feedback where resolved_at is null),
       'lists',      (select count(*) from firsts),
       'lists_shared', (select count(*) from public.wish_lists where submitted_at is not null),
@@ -1519,6 +1855,16 @@ create policy about_read on public.list_about
 -- Feedback has no policies on purpose: only the functions above can touch it.
 alter table public.feedback enable row level security;
 
+alter table public.signup_items    enable row level security;
+alter table public.signup_claims   enable row level security;
+alter table public.signup_activity enable row level security;   -- no policies: never readable from the website
+drop policy if exists signup_items_read on public.signup_items;
+create policy signup_items_read on public.signup_items
+  for select to authenticated using (public.is_member(group_id));
+drop policy if exists signup_claims_read on public.signup_claims;
+create policy signup_claims_read on public.signup_claims
+  for select to authenticated using (public.is_member(group_id));
+
 -- Notes, tracking links and arrival: same rules as prices.
 alter table public.claim_details enable row level security;
 drop policy if exists details_read on public.claim_details;
@@ -1629,6 +1975,7 @@ grant select, insert, delete on public.claims to authenticated;
 grant select, insert, update, delete on public.claim_prices to authenticated;
 grant select, insert, update, delete on public.claim_details to authenticated;
 grant select on public.santa_assignments, public.list_about to authenticated;
+grant select on public.signup_items, public.signup_claims to authenticated;
 grant select, insert, update, delete on public.extra_purchases to authenticated;
 
 revoke all on all functions in schema public from public, anon, authenticated;
@@ -1643,7 +1990,9 @@ grant execute on function
   public.is_owner(), public.owner_dashboard(int), public.owner_group_view(uuid),
   public.can_view_list(uuid, uuid), public.can_shop_for(uuid, uuid), public.create_secret_santa(text, date, int), public.start_secret_santa(uuid),
   public.set_list_about(uuid, uuid, text), public.announce_list_update(uuid, uuid, int, int, int, boolean),
-  public.submit_feedback(text, text), public.owner_feedback(), public.owner_set_feedback(uuid, boolean)
+  public.submit_feedback(text, text), public.owner_feedback(), public.owner_set_feedback(uuid, boolean),
+  public.create_signup(text, date, jsonb), public.signup_add_item(uuid, text, text, int), public.signup_edit_item(uuid, text, text, int),
+  public.signup_delete_item(uuid), public.signup_claim(uuid, int), public.signup_assign(uuid, uuid, int), public.send_signup_summaries()
   to authenticated;
 grant execute on function public.preview_invite(text) to anon, authenticated;
 
@@ -1658,3 +2007,16 @@ exception when others then
 end
 $unschedule$;
 drop function if exists public.send_reminders(date);
+
+-- ---------------------------------------------------------------------------
+-- Sign-up list summaries: check every 15 minutes, email each host at most once an hour.
+-- If pg_cron can't be turned on, nothing breaks: the website triggers the same check when people open it.
+-- ---------------------------------------------------------------------------
+do $signup_cron$
+begin
+  create extension if not exists pg_cron;
+  perform cron.schedule('signup-host-summaries', '*/15 * * * *', 'select public.send_signup_summaries();');
+exception when others then
+  raise notice 'pg_cron is not available (%). Host summaries will go out when people use the site.', sqlerrm;
+end
+$signup_cron$;
