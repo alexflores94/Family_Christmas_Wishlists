@@ -827,52 +827,88 @@ function renderAuth() {
 function landingView() {
   function go() { showLanding = false; renderAuth(); window.scrollTo({ top: 0 }); }
   function cta(id, text) { return h("button", { class: "btn primary lg", type: "button", id: id, onclick: go, text: text }); }
-  function shot(src, alt, w, hgt) {
-    return h("figure", { class: "shot" }, h("img", { src: src, alt: alt, width: String(w), height: String(hgt), loading: "lazy", decoding: "async" }));
-  }
+  function section(id, title) { return h("section", { class: "about-sec", "aria-labelledby": id }, h("h2", { id: id, class: "about-h2", text: title })); }
   var wrap = h("div", { class: "panel about", id: "about" });
+
   wrap.append(h("header", { class: "about-hero" },
     h("span", { class: "eyebrow", text: "Gifts, together" }),
     h("h1", { text: "Wish Orbit" }),
-    h("p", { class: "about-lead", text: "Make a wishlist, share it with family and friends, and let everyone else quietly mark what they’re buying. No double gifts, and the surprise stays a surprise." }),
+    h("p", { class: "about-lead", text: "Wishlists, gift exchanges, Secret Santa and event sign-ups, all shared with one link. Everyone sees what’s taken, so nothing gets doubled and surprises stay secret." }),
     h("div", { class: "about-actions" }, cta("about-cta", "Sign in or create an account"), h("span", { class: "muted", text: "Free. No password, just an emailed code." }))));
-  var why = h("section", { class: "about-why", "aria-labelledby": "why-h" }, h("h2", { id: "why-h", text: "Why it helps" }));
-  var cards = h("div", { class: "about-cards" });
-  [["No doubled gifts", "When someone marks a gift as purchased, everyone else sees it, so two people never buy the same thing."],
-   ["Surprises stay safe", "The person a list belongs to never sees what was picked or by whom. Only the people shopping do."],
-   ["Everything in one place", "Links, prices, notes, tracking numbers and what has arrived, for every gift you’ve bought, instead of scattered texts and screenshots."]].forEach(function (c) {
-    cards.append(h("div", { class: "card about-card" }, h("h3", { text: c[0] }), h("p", { class: "muted", text: c[1] })));
+
+  // the four kinds of orbit
+  var kinds = section("kinds-h", "Four ways to use it");
+  var kindGrid = h("div", { class: "about-kinds" });
+  [["🎁", "Group Gift Exchange", "Everyone makes a list and shops from each other’s."],
+   ["📝", "One-way wishlist", "You write the list, like a kid’s birthday. Others pick the gifts."],
+   ["🎅", "Secret Santa", "Draw names. Each person shops for one hidden list."],
+   ["🦃", "Event sign-up list", "List what the event needs. People claim what they’ll bring."]].forEach(function (k) {
+    kindGrid.append(h("div", { class: "card about-kind" },
+      h("span", { class: "about-emoji", "aria-hidden": "true", text: k[0] }), h("h3", { text: k[1] }), h("p", { class: "muted", text: k[2] })));
   });
-  why.append(cards);
+  kinds.append(kindGrid);
+  wrap.append(kinds);
+
+  // why it helps
+  var why = section("why-h", "Why it helps");
+  var whyGrid = h("div", { class: "about-why" });
+  [["No doubled gifts", "Taken items show as taken for everyone."],
+   ["Surprises stay safe", "You never see what was bought from your own list."],
+   ["One place for everything", "Lists, links, prices and tracking, not scattered texts."]].forEach(function (c) {
+    whyGrid.append(h("div", { class: "about-why-item" }, h("span", { class: "about-check", "aria-hidden": "true" }, icon("check")),
+      h("div", null, h("strong", { text: c[0] }), h("span", { class: "muted", text: c[1] }))));
+  });
+  why.append(whyGrid);
   wrap.append(why);
-  var how = h("section", { class: "about-how", "aria-labelledby": "how-h" }, h("h2", { id: "how-h", text: "How it works" }));
+
+  // feature highlights
+  var feats = section("feats-h", "What’s included");
+  var tiles = h("ul", { class: "about-tiles" });
+  [["Photos and prices from a link", "Paste a product link and they fill in."],
+   ["Mark as purchased", "Everyone else sees it. The list owner doesn’t."],
+   ["Private purchase tracker", "Price paid, notes, tracking and arrivals, even for gifts off the list."],
+   ["Lists for kids", "Make a list for anyone who isn’t on the site."],
+   ["About-me notes", "Sizes, hobbies and things to skip."],
+   ["Update emails", "Hear when a list you’re shopping changes."],
+   ["Fair Secret Santa draw", "Random picks. Not even the host knows who has whom."],
+   ["Claim and assign", "Sign-up lists show who’s bringing what, and hosts can assign items."],
+   ["Thanksgiving starter", "Begin a sign-up list with 19 classic dishes."],
+   ["Share as an image", "Save a sign-up list to text or post anywhere."],
+   ["Hourly host summary", "One email an hour, not one per change."],
+   ["Tidy after the event", "Orbits archive themselves once the date passes."]].forEach(function (t) {
+    tiles.append(h("li", { class: "about-tile" }, h("strong", { text: t[0] }), h("span", { class: "muted", text: t[1] })));
+  });
+  feats.append(tiles);
+  wrap.append(feats);
+
+  // how it works
+  var how = section("how-h", "How it works");
   var steps = h("ol", { class: "about-steps" });
-  [["Start an orbit", "Make a group gift exchange for a family Christmas or gift swap, or a one-way wishlist for a birthday."],
-   ["Share the link", "Send the invite link. People join with their email and a 6-digit code."],
-   ["Add your wishes", "Everyone writes their own list: name, a short note, a link, a price and how many."],
-   ["Shop together", "Open anyone’s list, mark gifts as bought, and keep notes and tracking in one place."]].forEach(function (x) {
+  [["Start an orbit", "Pick one of the four kinds."],
+   ["Share the link", "People join with their email and a 6-digit code."],
+   ["Add, pick, done", "Make lists, claim gifts or dishes, and track it all."]].forEach(function (x) {
     steps.append(h("li", null, h("strong", { text: x[0] }), h("span", { class: "muted", text: x[1] })));
   });
   how.append(steps);
   wrap.append(how);
-  wrap.append(h("h2", { class: "about-h2", text: "A look inside" }));
-  var feats = [
-    ["Every orbit in one place", "Your dashboard shows each group and wishlist you’re in, with the event date, who made it, how many people are in it and how many people you still have gifts to buy for.", ["Active and archived tabs", "Groups archive themselves after the event date", "One tap to start something new"], "img/about-dashboard.webp", "The Wish Orbit dashboard showing three orbits: a one-way birthday wishlist, an office gift swap and a family Christmas group", 1000, 640],
-    ["Two kinds of orbit", "Choose a group gift exchange where everyone writes their own list, or a one-way wishlist that you write for someone else, like a child’s birthday list to share with family.", ["Group gift exchanges: everyone lists and shops", "One-way wishlists: you write, others pick", "Invite by link, no accounts to set up in advance"], "img/about-orbit.webp", "The New orbit screen offering a group gift exchange or a one-way wishlist", 1000, 520],
-    ["Build your list", "Add what you’d love, with a name, a short note, a link, a price and a quantity. Paste a product link and the site can fill in the photo and price for you.", ["Save a draft, share when you’re ready", "Photo and price from the link", "Make lists for kids or anyone who isn’t on the site"], "img/about-editor.webp", "A wishlist being written, with item name, description, link, quantity and price fields", 1000, 900],
-    ["See everyone’s lists", "Everyone’s lists are on one page, with who has shared and how far along the shopping is. Open a list to see every item, then tick Mark as purchased.", ["Photos, prices and links on every item", "Progress bar per list", "Items with a quantity stay open until all are taken"], "img/about-everyone.webp", "The group page showing everyone’s lists and how many gifts have been purchased", 1000, 780],
-    ["Pick gifts without spoiling anything", "Mark a gift as purchased and the rest of the group sees it’s taken. The list’s owner can’t see it, so nothing is spoiled.", ["Note what you actually paid", "Undo any time", "Purchases made for a child’s list count as yours"], "img/about-list.webp", "One person’s wishlist with item photos, prices and Mark as purchased buttons", 1000, 860],
-    ["Track every purchase", "Your Purchases tab is a private shopping dashboard: what you bought, which store it came from, a note, a tracking link and a checkbox for when it arrives.", ["Status: purchased, on its way, in hand", "Totals and a store-by-store summary", "Notes and tracking are visible only to you"], "img/about-purchases.webp", "The Purchases tab with status totals, store summary, notes and tracking links", 1000, 1150]
-  ];
-  feats.forEach(function (f, i) {
-    var list = h("ul", { class: "about-list" });
-    f[2].forEach(function (b) { list.append(h("li", { text: b })); });
-    wrap.append(h("section", { class: "about-feature" + (i % 2 ? " flip" : "") },
-      h("div", { class: "about-copy" }, h("h3", { text: f[0] }), h("p", { text: f[1] }), list), shot(f[3], f[4], f[5], f[6])));
+
+  // a quick look
+  var look = section("look-h", "A quick look");
+  var gallery = h("div", { class: "about-gallery" });
+  [["img/about-dashboard.webp", "Your dashboard", "The dashboard listing each orbit with its event date and how many people are left to shop for", 1000, 640],
+   ["img/about-everyone.webp", "Everyone’s lists", "A group page showing everyone’s lists and shopping progress", 1000, 780],
+   ["img/about-list.webp", "Mark as purchased", "One person’s wishlist with photos, prices and Mark as purchased buttons", 1000, 860],
+   ["img/about-purchases.webp", "Your purchases", "The private Purchases tab with status totals, notes and tracking links", 1000, 1150]].forEach(function (g) {
+    gallery.append(h("figure", { class: "about-shot" },
+      h("div", { class: "shot" }, h("img", { src: g[0], alt: g[2], width: String(g[3]), height: String(g[4]), loading: "lazy", decoding: "async" })),
+      h("figcaption", { text: g[1] })));
   });
+  look.append(gallery);
+  wrap.append(look);
+
   wrap.append(h("section", { class: "about-final card" },
-    h("h2", { text: "Ready to start your orbit?" }),
-    h("p", { class: "muted", text: "Sign in with your email to create your first group or wishlist, or open an invite link someone sent you." }),
+    h("h2", { text: "Ready to start?" }),
+    h("p", { class: "muted", text: "Sign in to create an orbit, or open an invite link someone sent you." }),
     cta("about-cta-2", "Sign in or create an account")));
   return wrap;
 }
