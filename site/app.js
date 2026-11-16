@@ -847,7 +847,7 @@ function landingView() {
   wrap.append(why);
   var how = h("section", { class: "about-how", "aria-labelledby": "how-h" }, h("h2", { id: "how-h", text: "How it works" }));
   var steps = h("ol", { class: "about-steps" });
-  [["Start an orbit", "Make a group event for a family Christmas or gift swap, or a one-way wishlist for a birthday."],
+  [["Start an orbit", "Make a group gift exchange for a family Christmas or gift swap, or a one-way wishlist for a birthday."],
    ["Share the link", "Send the invite link. People join with their email and a 6-digit code."],
    ["Add your wishes", "Everyone writes their own list: name, a short note, a link, a price and how many."],
    ["Shop together", "Open anyone’s list, mark gifts as bought, and keep notes and tracking in one place."]].forEach(function (x) {
@@ -858,7 +858,7 @@ function landingView() {
   wrap.append(h("h2", { class: "about-h2", text: "A look inside" }));
   var feats = [
     ["Every orbit in one place", "Your dashboard shows each group and wishlist you’re in, with the event date, who made it, how many people are in it and how many people you still have gifts to buy for.", ["Active and archived tabs", "Groups archive themselves after the event date", "One tap to start something new"], "img/about-dashboard.webp", "The Wish Orbit dashboard showing three orbits: a one-way birthday wishlist, an office gift swap and a family Christmas group", 1000, 640],
-    ["Two kinds of orbit", "Choose a group event where everyone writes their own list, or a one-way wishlist that you write for someone else, like a child’s birthday list to share with family.", ["Group events: everyone lists and shops", "One-way wishlists: you write, others pick", "Invite by link, no accounts to set up in advance"], "img/about-orbit.webp", "The New orbit screen offering a group event or a one-way wishlist", 1000, 520],
+    ["Two kinds of orbit", "Choose a group gift exchange where everyone writes their own list, or a one-way wishlist that you write for someone else, like a child’s birthday list to share with family.", ["Group gift exchanges: everyone lists and shops", "One-way wishlists: you write, others pick", "Invite by link, no accounts to set up in advance"], "img/about-orbit.webp", "The New orbit screen offering a group gift exchange or a one-way wishlist", 1000, 520],
     ["Build your list", "Add what you’d love, with a name, a short note, a link, a price and a quantity. Paste a product link and the site can fill in the photo and price for you.", ["Save a draft, share when you’re ready", "Photo and price from the link", "Make lists for kids or anyone who isn’t on the site"], "img/about-editor.webp", "A wishlist being written, with item name, description, link, quantity and price fields", 1000, 900],
     ["See everyone’s lists", "Everyone’s lists are on one page, with who has shared and how far along the shopping is. Open a list to see every item, then tick Mark as purchased.", ["Photos, prices and links on every item", "Progress bar per list", "Items with a quantity stay open until all are taken"], "img/about-everyone.webp", "The group page showing everyone’s lists and how many gifts have been purchased", 1000, 780],
     ["Pick gifts without spoiling anything", "Mark a gift as purchased and the rest of the group sees it’s taken. The list’s owner can’t see it, so nothing is spoiled.", ["Note what you actually paid", "Undo any time", "Purchases made for a child’s list count as yours"], "img/about-list.webp", "One person’s wishlist with item photos, prices and Mark as purchased buttons", 1000, 860],
@@ -1018,7 +1018,7 @@ function dashboardView() {
   var wrap = h("div", { class: "panel" });
   wrap.append(h("div", { class: "dash-head" },
     h("div", { class: "page-head" }, h("h2", { text: "Your wish orbits" }),
-      h("p", { class: "muted", text: dashTab === "archived" ? "Archived groups and wishlists are view-only. Nothing in them can be changed." : groups.length ? "Open a group to add your wishes or shop for the people in it." : "Start a new orbit: a group event for a gift swap, or a one-way wishlist to share with family." })),
+      h("p", { class: "muted", text: dashTab === "archived" ? "Archived groups and wishlists are view-only. Nothing in them can be changed." : groups.length ? "Open a group to add your wishes or shop for the people in it." : "Start a new orbit: a group gift exchange, or a one-way wishlist to share with family." })),
     h("div", { style: "display:flex;gap:8px;flex-wrap:wrap" },
       isOwner ? h("button", { class: "btn", type: "button", id: "open-admin", onclick: function () { route = { name: "admin" }; renderMain(); window.scrollTo({ top: 0 }); }, text: "Admin" }) : null,
       h("button", { class: "btn primary", type: "button", id: "new-orbit", onclick: function () { route = { name: "new-orbit" }; renderMain(); window.scrollTo({ top: 0 }); } }, icon("plus"), "New orbit"))));
@@ -1293,7 +1293,7 @@ function newOrbitView() {
   }
   return h("div", { class: "card item", id: "orbit-choose" },
     h("div", { class: "page-head" }, h("h2", { text: "New orbit" }), h("p", { class: "muted", text: "What kind of orbit do you want to start?" })),
-    option("pick-group", "Group event", "Everyone in the group makes their own wishlist, and everyone can shop from each other’s lists. Good for family Christmas, friends or a gift swap.", "new"),
+    option("pick-group", "Group Gift Exchange", "Everyone in the group makes their own wishlist, and everyone can shop from each other’s lists. Good for family Christmas, friends or a gift swap.", "new"),
     option("pick-wishlist", "One-way wishlist", "You write the lists, like a birthday or Christmas list for your kids. People with your link can view them and pick gifts, but can’t make lists of their own.", "new-wishlist"),
     option("pick-signup", "Event sign-up list", "List what your event needs, like dishes for Thanksgiving, and share the link. People claim what they’ll bring or add something new, so nothing gets doubled up. You can assign items too.", "new-signup"),
     option("pick-santa", "Secret Santa", "Everyone shares a list, then you draw names. Each person is given one list to buy from. Nobody can see anyone else’s list, and not even you will know who has whom.", "new-santa"),
@@ -1306,7 +1306,7 @@ function newGroupView(kind) {
   var err = h("p", { class: "err", hidden: true, role: "alert", id: "g-err" });
   var btn = h("button", { class: "btn primary", type: "submit", id: "g-create", text: santa ? "Create Secret Santa" : "Create group" });
   var form = h("form", { class: "card item", id: "g-form", novalidate: true },
-    h("div", { class: "page-head" }, h("h2", { text: santa ? "New Secret Santa" : "New group event" })),
+    h("div", { class: "page-head" }, h("h2", { text: santa ? "New Secret Santa" : "New Group Gift Exchange" })),
     h("div", { class: "card", id: "g-how", style: "padding:10px 12px;margin-bottom:12px" },
       h("strong", { text: santa ? "How Secret Santa works" : "How sharing works" }),
       h("p", { class: "muted", style: "margin:4px 0 0;font-size:14px", id: santa ? "g-how-santa" : "g-how-text", text: santa ? "You get an invite link to send around. Everyone who joins writes a list and shares it. Players can see who has joined and who has shared, but nobody can read any list yet, and you are only told when lists are shared. When enough people have shared, you press a button to draw names. Each player is then given one other player’s list at random, can read it and mark gifts as purchased, and is emailed. The draw is final, and you won’t be able to see who has whom, so you can play too." : "You get an invite link to send around. Everyone who joins writes their own wishlist and shares it when it’s ready. Once shared, the whole group can see it and mark gifts as purchased. The person the list belongs to never sees who bought what, so gifts stay a surprise. Members can also make lists for others, like their kids." })),
